@@ -87,6 +87,7 @@ static size_t s_reply_len = 0;
 static volatile int64_t s_rx_last_audio_ms = 0;
 static volatile uint32_t s_rx_bytes_total = 0;
 static volatile uint32_t s_rx_dropped = 0;
+static volatile uint32_t s_rx_rearms = 0;  // watchdog recoveries (stuck TX / stream off)
 
 static int64_t now_ms(void) {
     return esp_timer_get_time() / 1000;
@@ -439,7 +440,11 @@ esp_err_t trusdx_tx_end(void) {
     vTaskDelay(pdMS_TO_TICKS(k_tx_lead_samples * 1000 / (int)k_tx_rate_hz + 10));
     s_tx_active = false;
     s_rx_last_audio_ms = now_ms();  // RX stream resumes after RX;
+    // Sent twice (as the original trusdx-audio script did): a lost RX; leaves
+    // the radio keyed with no audio — zero output, "nan" SWR, no RX stream.
     esp_err_t err = s_cdc ? send_raw_cmd(";RX;", 200) : ESP_ERR_INVALID_STATE;
+    vTaskDelay(pdMS_TO_TICKS(30));
+    if (s_cdc) send_raw_cmd(";RX;", 200);
     ESP_LOGI(TAG, "TX end sent=%llu errors=%u rc=%s",
              (unsigned long long)s_tx_sent, (unsigned)s_tx_write_errors, esp_err_to_name(err));
     return err;
@@ -502,7 +507,9 @@ static void update_debug_lines(void) {
     float rate = (last_ms > 0) ? (float)(bytes - last_bytes) * 1000.0f / (float)(t - last_ms) : 0.0f;
     last_ms = t;
     last_bytes = bytes;
-    snprintf(s_dbg1, sizeof(s_dbg1), "rx %.0fHz d%lu", (double)rate, (unsigned long)s_rx_dropped);
+    // Shown as "truSDX rx7812 d0 w0" on the STATUS line (19 chars).
+    snprintf(s_dbg1, sizeof(s_dbg1), "rx%.0f d%lu w%lu", (double)rate,
+             (unsigned long)s_rx_dropped, (unsigned long)s_rx_rearms);
     snprintf(s_dbg2, sizeof(s_dbg2), "tx=%s sent=%llu err=%u", s_tx_active ? "on" : "off",
              (unsigned long long)s_tx_sent, (unsigned)s_tx_write_errors);
 }
@@ -546,9 +553,11 @@ static void ctrl_task(void* arg) {
         }
         if (s_state == TRUSDX_STREAMING && !s_tx_active &&
             now_ms() - s_rx_last_audio_ms > k_rx_watchdog_ms) {
-            // Radio rebooted or dropped streaming: re-arm it.
-            ESP_LOGW(TAG, "No RX audio for %d ms, re-enabling stream", k_rx_watchdog_ms);
-            send_raw_cmd(";UA2;", 200);
+            // Radio stuck in TX (missed RX;), rebooted, or dropped streaming:
+            // force RX and re-arm streaming.
+            ESP_LOGW(TAG, "No RX audio for %d ms, forcing RX + stream", k_rx_watchdog_ms);
+            send_raw_cmd(";RX;UA2;", 200);
+            s_rx_rearms++;
             s_rx_last_audio_ms = now_ms();
         }
         update_debug_lines();
@@ -625,6 +634,7 @@ bool trusdx_stream_start(void) {
     s_ch34x_pid = CH34X_PID_AUTO;
     s_rx_bytes_total = 0;
     s_rx_dropped = 0;
+    s_rx_rearms = 0;
     ft8_audio_pipeline_clear_latest_waterfall_row();
 
     if (!s_cdc_lock) s_cdc_lock = xSemaphoreCreateMutex();
