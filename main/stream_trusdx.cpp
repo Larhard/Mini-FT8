@@ -319,8 +319,8 @@ static volatile bool s_tx_active = false;  // radio keyed by us
 
 esp_err_t trusdx_cat_send(const char* cmd, uint32_t timeout_ms) {
     if (!trusdx_cat_ready() || !cmd) return ESP_ERR_INVALID_STATE;
-    if (!s_tx_active) return send_raw_cmd(cmd, timeout_ms);
-    // While TX samples are streaming, ';' ends the audio before the command.
+    // Always lead with ';' (as trusdx-txrx.py and FT8CN do): it terminates
+    // any stray bytes in the radio's command buffer, and ends TX audio.
     char buf[40];
     snprintf(buf, sizeof(buf), ";%s", cmd);
     return send_raw_cmd(buf, timeout_ms);
@@ -392,7 +392,7 @@ static bool tx_start(void) {
     s_tx_done = false;
     s_tx_write_errors = 0;
     // The radio stops streaming RX audio and starts consuming samples.
-    if (send_raw_cmd("TX0;", 200) != ESP_OK) return false;
+    if (send_raw_cmd(";TX0;", 200) != ESP_OK) return false;
     s_tx_active = true;
     s_tx_t0_us = esp_timer_get_time();
     s_tx_run = true;
