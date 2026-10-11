@@ -35,8 +35,8 @@ const char* trusdx_get_debug_line2(void);
 
 // CAT link is open and the radio has finished its post-open reset delay.
 bool trusdx_cat_ready(void);
-// Send one CAT command such as "FA00014074000;". A leading ';' is always
-// added: it flushes stray bytes in the radio's parser and ends TX audio.
+// Send one CAT command such as "FA00014074000;". While TX audio is
+// streaming a leading ';' is added so the command is not taken as audio.
 esp_err_t trusdx_cat_send(const char* cmd, uint32_t timeout_ms);
 
 // Key the radio (";TX0;") and stream an FT8/FT4 CPFSK waveform at 11520 Hz.
