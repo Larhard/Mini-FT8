@@ -33,10 +33,15 @@ extern volatile bool g_cdc_initial_sync_pending;
 static constexpr uint32_t k_cat_baud = 115200;      // firmware >= 2.00t
 static constexpr int k_reset_wait_ms = 3000;        // CH340 DTR toggles the ATmega reset
 static constexpr float k_rx_rate_hz = 7812.5f;      // 62500 / 8, nominal
+// Real rates differ between firmware builds (7936 Hz measured on 2.00x), and
+// a 1-2 % error smears FT8 symbol timing over a 12.6 s frame. The resampler
+// uses a running estimate measured from the byte rate while in RX.
+static constexpr float k_rx_rate_min_hz = 7600.0f;
+static constexpr float k_rx_rate_max_hz = 8200.0f;
 static constexpr float k_tx_rate_hz = 11520.0f;     // = 115200 baud / 10 bits
 static constexpr float k_out_rate_hz = 6000.0f;     // FT8 pipeline rate
 static constexpr uint8_t k_semicolon = 0x3B;
-static constexpr size_t k_rx_sb_size = 4096;        // ~0.5 s of RX audio
+static constexpr size_t k_rx_sb_size = 16384;       // ~2 s: survives a slot decode
 static constexpr size_t k_rx_backlog_max = 2400;    // trim above ~300 ms latency
 static constexpr size_t k_rx_backlog_keep = 800;    // ...down to ~100 ms
 static constexpr int k_rx_read_wait_ms = 60;
@@ -87,7 +92,9 @@ static size_t s_reply_len = 0;
 static volatile int64_t s_rx_last_audio_ms = 0;
 static volatile uint32_t s_rx_bytes_total = 0;
 static volatile uint32_t s_rx_dropped = 0;
-static volatile uint32_t s_rx_rearms = 0;  // watchdog recoveries (stuck TX / stream off)
+static volatile uint32_t s_rx_rearms = 0;
+static volatile float s_rx_rate_est = k_rx_rate_hz;
+static uint32_t s_rx_rate_windows = 0;  // watchdog recoveries (stuck TX / stream off)
 
 static int64_t now_ms(void) {
     return esp_timer_get_time() / 1000;
@@ -193,7 +200,7 @@ static void rx_resampler_init(void) {
 }
 
 static int rx_resample(const uint8_t* in, int n_in, float* out, int max_out) {
-    const float step = k_rx_rate_hz / k_out_rate_hz;  // input samples per output
+    const float step = s_rx_rate_est / k_out_rate_hz;  // input samples per output
     int n_out = 0;
     for (int i = 0; i < n_in; ++i) {
         const float x = ((float)in[i] - 128.0f) / 128.0f;
@@ -498,18 +505,31 @@ static bool try_open(void) {
     return true;
 }
 
-static void update_debug_lines(void) {
+// Called ~once per second from the ctrl task: measures the RX byte rate and
+// updates the resampler's rate estimate from gap-free RX windows.
+static void update_rate_and_debug(void) {
     static int64_t last_ms = 0;
     static uint32_t last_bytes = 0;
+    static bool window_had_tx = false;
     int64_t t = now_ms();
+    if (s_tx_active) window_had_tx = true;
     if (t - last_ms < 1000) return;
     uint32_t bytes = s_rx_bytes_total;
     float rate = (last_ms > 0) ? (float)(bytes - last_bytes) * 1000.0f / (float)(t - last_ms) : 0.0f;
+    const bool usable = last_ms > 0 && !window_had_tx && !s_tx_active &&
+                        rate >= k_rx_rate_min_hz && rate <= k_rx_rate_max_hz;
     last_ms = t;
     last_bytes = bytes;
-    // Shown as "truSDX rx7812 d0 w0" on the STATUS line (19 chars).
-    snprintf(s_dbg1, sizeof(s_dbg1), "rx%.0f d%lu w%lu", (double)rate,
-             (unsigned long)s_rx_dropped, (unsigned long)s_rx_rearms);
+    window_had_tx = false;
+    if (usable) {
+        // First window seeds the estimate; then a ~20 s exponential average
+        // smooths out USB packet granularity.
+        s_rx_rate_est = (s_rx_rate_windows == 0) ? rate : s_rx_rate_est + 0.05f * (rate - s_rx_rate_est);
+        s_rx_rate_windows++;
+    }
+    // Shown on the STATUS line, which fits 19 characters.
+    snprintf(s_dbg1, sizeof(s_dbg1), "rx%.0f w%lu d%lu", (double)s_rx_rate_est,
+             (unsigned long)s_rx_rearms, (unsigned long)s_rx_dropped);
     snprintf(s_dbg2, sizeof(s_dbg2), "tx=%s sent=%llu err=%u", s_tx_active ? "on" : "off",
              (unsigned long long)s_tx_sent, (unsigned)s_tx_write_errors);
 }
@@ -560,7 +580,7 @@ static void ctrl_task(void* arg) {
             s_rx_rearms = s_rx_rearms + 1;
             s_rx_last_audio_ms = now_ms();
         }
-        update_debug_lines();
+        update_rate_and_debug();
         vTaskDelay(pdMS_TO_TICKS(100));
     }
     close_cdc();
@@ -635,6 +655,8 @@ bool trusdx_stream_start(void) {
     s_rx_bytes_total = 0;
     s_rx_dropped = 0;
     s_rx_rearms = 0;
+    s_rx_rate_est = k_rx_rate_hz;
+    s_rx_rate_windows = 0;
     ft8_audio_pipeline_clear_latest_waterfall_row();
 
     if (!s_cdc_lock) s_cdc_lock = xSemaphoreCreateMutex();

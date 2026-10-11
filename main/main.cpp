@@ -3588,7 +3588,7 @@ static std::string status_sync_line() {
   if (radio == RadioType::TRUSDX || radio == RadioType::FX4CR) {
     // Show connection progress so a missing/undetected radio is visible.
     if (streaming && radio == RadioType::TRUSDX) {
-      return head_trim(std::string("truSDX ") + audio_source_get_debug_line1(), 19);
+      return head_trim(audio_source_get_debug_line1(), 19);  // "rx7936 w0 d0"
     }
     if (!streaming) {
       const std::string rx_status = audio_source_get_status_string();
