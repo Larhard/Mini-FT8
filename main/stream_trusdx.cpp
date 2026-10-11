@@ -557,7 +557,7 @@ static void ctrl_task(void* arg) {
             // force RX and re-arm streaming.
             ESP_LOGW(TAG, "No RX audio for %d ms, forcing RX + stream", k_rx_watchdog_ms);
             send_raw_cmd(";RX;UA2;", 200);
-            s_rx_rearms++;
+            s_rx_rearms = s_rx_rearms + 1;
             s_rx_last_audio_ms = now_ms();
         }
         update_debug_lines();
