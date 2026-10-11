@@ -191,7 +191,8 @@ The FX-4CR's USB port is an internal USB hub. Behind it sit a C-Media USB sound 
 Mini-FT8 enables USB hub support and opens CH34x, CP210x or CDC-ACM bridges automatically.
 
 - Select `FX-4CR` in MENU P2 (`N` -> `3`).
-- The Cardputer must power the radio's USB side, so supply 5 V to PORTA and **set the micro switch to the right** (5VIN), the same as for KH1-USBC.
+- Power the radio from its own 12 V supply (XT60) as usual. The USB port does not power the radio.
+- A USB host must provide 5 V on the cable, which the radio's internal hub, sound card and serial bridge use. Supply 5 V from an external source (power bank/adapter) to PORTA and **set the micro switch to the right** (5VIN), the same as for KH1-USBC. The Cardputer passes this through to USB-C; its battery is not used.
 - Use the radio's own USB cable: TRRS-to-USB-A on V/VR units, USB-C on R units. Add a USB-A (female) to USB-C (male) OTG adapter for the Cardputer.
 - Radio settings:
   - `Digital mode (CAT)` = `DATA` (the default). Mini-FT8 sends `MD2;`, which the F5BUD firmware then maps to DATA-U. In DATA-L/U the radio takes TX audio from USB.
@@ -217,7 +218,9 @@ the firmware's **CAT audio streaming**:
 
 - Requires truSDX firmware **2.00u or newer**; CAT runs at 115200 baud from 2.00t on.
 - Select `truSDX` in MENU P2 (`N` -> `3`).
-- Supply 5 V to PORTA and **set the micro switch to the right** (5VIN). With no 12 V connected, the radio runs from this USB 5 V at about 0.5 W out, so the 5 V source must handle the radio's current.
+- **Always power the radio from its own 12 V supply.** Without it, the truSDX runs the whole radio from USB 5 V (about 0.5 W out, several hundred mA in TX), and that current would flow through the Cardputer's PORTA and USB-C path.
+- Supply 5 V from an external source to PORTA and **set the micro switch to the right** (5VIN). With 12 V connected, this only feeds the CH340 serial bridge, a few tens of mA.
+- To keep the radio's USB current off the Cardputer entirely, put a self-powered USB hub between the Cardputer and the radio. Hub support is enabled in this build.
 - Cable: Micro-USB (male) to USB-C (male) OTG cable or adapter.
 - After the port opens, Mini-FT8 waits 3 s, because opening the CH340 resets the ATmega. It then sends `MD2;UA2;` and the current band frequency.
 - Radio menu recommendations:
