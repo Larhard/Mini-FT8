@@ -502,7 +502,7 @@ static void update_debug_lines(void) {
     float rate = (last_ms > 0) ? (float)(bytes - last_bytes) * 1000.0f / (float)(t - last_ms) : 0.0f;
     last_ms = t;
     last_bytes = bytes;
-    snprintf(s_dbg1, sizeof(s_dbg1), "rx=%.0fHz drop=%lu", (double)rate, (unsigned long)s_rx_dropped);
+    snprintf(s_dbg1, sizeof(s_dbg1), "rx %.0fHz d%lu", (double)rate, (unsigned long)s_rx_dropped);
     snprintf(s_dbg2, sizeof(s_dbg2), "tx=%s sent=%llu err=%u", s_tx_active ? "on" : "off",
              (unsigned long long)s_tx_sent, (unsigned)s_tx_write_errors);
 }
@@ -521,7 +521,7 @@ static void ctrl_task(void* arg) {
             if (try_open()) {
                 opened_ms = now_ms();
                 s_state = TRUSDX_RESET_WAIT;
-                snprintf(s_status, sizeof(s_status), "truSDX found, starting");
+                snprintf(s_status, sizeof(s_status), "truSDX found, wait");
             } else {
                 vTaskDelay(pdMS_TO_TICKS(500));
                 continue;

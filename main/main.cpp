@@ -3585,6 +3585,16 @@ static std::string status_sync_line() {
     if (cat_ready && !streaming) return std::string("Sync ") + name + "(TX)";
     return std::string("Connect ") + name;
   }
+  if (radio == RadioType::TRUSDX || radio == RadioType::FX4CR) {
+    // Show connection progress so a missing/undetected radio is visible.
+    if (streaming && radio == RadioType::TRUSDX) {
+      return head_trim(std::string("truSDX ") + audio_source_get_debug_line1(), 19);
+    }
+    if (!streaming) {
+      const std::string rx_status = audio_source_get_status_string();
+      if (rx_status != "Idle") return head_trim(rx_status, 19);
+    }
+  }
   if (streaming) return std::string("Sync to ") + radio_name(radio);
   return std::string("Connect to ") + radio_name(radio);
 }
