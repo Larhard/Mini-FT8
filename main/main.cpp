@@ -1554,7 +1554,7 @@ static const char* offset_name(OffsetSrc o) {
 }
 
 static RadioType canonical_radio_type(RadioType r) {
-  if (r == RadioType::QDX ||
+  if (r == RadioType::QDX || r == RadioType::FX4CR || r == RadioType::TRUSDX ||
       r == RadioType::KH1_USBC || r == RadioType::KH1_MIC) return r;
   return RadioType::QMX;
 }
@@ -1583,6 +1583,10 @@ static RadioType radio_type_from_saved_int(int value) {
       return RadioType::KH1_MIC;
     case (int)RadioType::QDX:
       return RadioType::QDX;
+    case (int)RadioType::FX4CR:
+      return RadioType::FX4CR;
+    case (int)RadioType::TRUSDX:
+      return RadioType::TRUSDX;
     case (int)RadioType::QMX:
     default:
       return RadioType::QMX;
@@ -1614,6 +1618,12 @@ static RadioType parse_radio_config_value(const char* raw) {
   if (token == "QDX") {
     return RadioType::QDX;
   }
+  if (token == "FX4CR" || token == "FX-4CR" || token == "FX_4CR") {
+    return RadioType::FX4CR;
+  }
+  if (token == "TRUSDX" || token == "(TR)USDX" || token == "USDX") {
+    return RadioType::TRUSDX;
+  }
   return RadioType::QMX;
 }
 
@@ -1625,6 +1635,10 @@ static RadioProfileBinding get_radio_profile_binding(RadioType r) {
       return {AUDIO_SOURCE_KH1_MIC, RADIO_CONTROL_KH1_CAT};
     case RadioType::QDX:
       return {AUDIO_SOURCE_QMX_UAC, RADIO_CONTROL_QDX};
+    case RadioType::FX4CR:
+      return {AUDIO_SOURCE_FX4CR_UAC, RADIO_CONTROL_FX4CR};
+    case RadioType::TRUSDX:
+      return {AUDIO_SOURCE_TRUSDX_CAT, RADIO_CONTROL_TRUSDX};
     case RadioType::QMX:
     default:
       return {AUDIO_SOURCE_QMX_UAC, RADIO_CONTROL_QMX};
@@ -1635,6 +1649,8 @@ static const char* radio_name(RadioType r) {
   switch (canonical_radio_type(r)) {
     case RadioType::QMX: return "QMX";
     case RadioType::QDX: return "QDX";
+    case RadioType::FX4CR: return "FX-4CR";
+    case RadioType::TRUSDX: return "truSDX";
     case RadioType::KH1_USBC: return "KH1-USBC";
     case RadioType::KH1_MIC: return "KH1-MIC";
     default: break;
@@ -3358,17 +3374,18 @@ static void tx_start(int skip_tones) {
     }
   }
 
-  // QDX uses sample-counted UAC OUT. QMX and KH1 retain their existing
-  // per-symbol CAT paths.
-  if (g_tx_cat_ok && canonical_radio_type(g_radio) == RadioType::QDX) {
+  // QDX, FX-4CR (UAC OUT) and truSDX (CAT audio stream) take a
+  // host-synthesized waveform. QMX and KH1 retain their per-symbol CAT paths.
+  if (g_tx_cat_ok && radio_control_uses_tx_waveform()) {
     const int remaining_tones = g_protocol->total_symbols - g_tx_tone_idx;
     if (remaining_tones <= 0 ||
-        !uac_tx_begin_cpfsk(static_cast<float>(g_tx_base_hz),
-                            g_tx_tones + g_tx_tone_idx,
-                            static_cast<size_t>(remaining_tones),
-                            g_protocol->tone_spacing,
-                            g_protocol->samples_per_symbol)) {
-      ESP_LOGW(TAG, "tx_start: QDX UAC OUT start failed");
+        radio_control_start_tx_waveform(static_cast<float>(g_tx_base_hz),
+                                        g_tx_tones + g_tx_tone_idx,
+                                        static_cast<size_t>(remaining_tones),
+                                        g_protocol->tone_spacing,
+                                        g_protocol->symbol_period,
+                                        g_protocol->samples_per_symbol) != ESP_OK) {
+      ESP_LOGW(TAG, "tx_start: TX waveform start failed (%s)", radio_name(g_radio));
       radio_control_end_tx();
       g_tx_cat_ok = false;
       return;
@@ -5486,6 +5503,12 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                       g_radio = RadioType::QDX;
                       break;
                     case RadioType::QDX:
+                      g_radio = RadioType::FX4CR;
+                      break;
+                    case RadioType::FX4CR:
+                      g_radio = RadioType::TRUSDX;
+                      break;
+                    case RadioType::TRUSDX:
                       g_radio = RadioType::KH1_USBC;
                       break;
                     case RadioType::KH1_USBC:

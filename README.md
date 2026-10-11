@@ -82,7 +82,7 @@ Mini-FT8 is built on Karlis Goba’s ft8_lib. It’s also a joint adventure betw
 |  | `6` | Enter Sleep. Shows battery info. |
 | `N` (MENU P2) | `1` | Select offset source: Random / RX / Fixed. Random values are within 500-2500 Hz. |
 |  | `2` | Edit fixed cursor offset (in place). Enter directly or use `▲` `▼` `◀` `▶`. |
-|  | `3` | Select radio (`QMX` / `QDX` / `KH1-USBC` / `KH1-MIC`). |
+|  | `3` | Select radio (`QMX` / `QDX` / `FX-4CR` / `truSDX` / `KH1-USBC` / `KH1-MIC`). |
 |  | `4` | Edit ignore list (Long Edit). Prefixes are separated by spaces; maximum 64 characters. |
 |  | `5` | Edit comment (Long Edit). Used for ADIF logging. Supports `/Radio` and `/Grid` macro expansion. |
 |  | `6` | Select FT8 / FT4 protocol. Reboot to apply the change. |
@@ -183,3 +183,55 @@ updates write the DS3231 when it is present; FT8 decode fine corrections do not.
 
 - Mini-FT8 automatically sets KH1 TX power to 2 W.
 - For best RX performance, reduce AF volume to `05` or `06`.
+
+## FX-4CR (F5BUD firmware) Connections
+
+The FX-4CR's USB port is an internal USB hub. Behind it sit a C-Media USB sound card
+(RX and TX audio) and a USB-serial bridge for CAT. The CAT is Kenwood TS-590S at 115200 baud.
+Mini-FT8 enables USB hub support and opens CH34x, CP210x or CDC-ACM bridges automatically.
+
+- Select `FX-4CR` in MENU P2 (`N` -> `3`).
+- The Cardputer must power the radio's USB side, so supply 5 V to PORTA and **set the micro switch to the right** (5VIN), the same as for KH1-USBC.
+- Use the radio's own USB cable: TRRS-to-USB-A on V/VR units, USB-C on R units. Add a USB-A (female) to USB-C (male) OTG adapter for the Cardputer.
+- Radio settings:
+  - `Digital mode (CAT)` = `DATA` (the default). Mini-FT8 sends `MD2;`, which the F5BUD firmware then maps to DATA-U. In DATA-L/U the radio takes TX audio from USB.
+  - Keep `RTS as PTT` in mind: Mini-FT8 holds RTS and DTR low.
+  - Adjust `Aux-Input-Level` / `Aux-Output-Level` (Usb & Bt) for a clean TX signal and sensible RX level.
+- TX uses CAT `TX;` / `RX;`, plus a 48 kHz FT8/FT4 waveform on the USB sound card, the same as QDX.
+
+```text
+┌───────────────────┐   USB (hub: C-Media audio + serial bridge)   ┌─────────────────────┐
+│ FX-4CR            ├──────────────────────────────────────────────┤ USB-C  Cardputer ADV│
+│                   │                                               │                     │
+└───────────────────┘                   5 V supply ─────────────────┤ PORTA 5V / GND      │
+                                                                    │ SW: 5VIN (Right)    │
+                                                                    └─────────────────────┘
+```
+
+## (tr)uSDX Connections
+
+The (tr)uSDX has no USB sound card. Its Micro-USB port is a CH340G serial bridge to the ATmega. Mini-FT8 uses
+the firmware's **CAT audio streaming**:
+- RX audio arrives as 8-bit samples at about 7.8 kHz inside the CAT link, enabled with `UA2;`, which also mutes the radio speaker.
+- TX audio is sent back as 8-bit samples at 11.52 kHz after `TX0;`.
+
+- Requires truSDX firmware **2.00u or newer**; CAT runs at 115200 baud from 2.00t on.
+- Select `truSDX` in MENU P2 (`N` -> `3`).
+- Supply 5 V to PORTA and **set the micro switch to the right** (5VIN). With no 12 V connected, the radio runs from this USB 5 V at about 0.5 W out, so the 5 V source must handle the radio's current.
+- Cable: Micro-USB (male) to USB-C (male) OTG cable or adapter.
+- After the port opens, Mini-FT8 waits 3 s, because opening the CH340 resets the ATmega. It then sends `MD2;UA2;` and the current band frequency.
+- Radio menu recommendations:
+  - `TX Drive` = `8` (constant amplitude).
+  - Semi-QSK `OFF`.
+  - Calibrate `Ref freq` for accurate frequency.
+- Keep the TX offset between about 200 and 2300 Hz; truSDX TX audio bandwidth is about 2.4 kHz.
+- Decoding works from 8-bit audio, but the dynamic range is only about 46 dB. Keep the RX gain/attenuator so the band noise is not clipping.
+
+```text
+┌───────────────────┐        Micro-USB (CH340G, CAT + audio)        ┌─────────────────────┐
+│ (tr)uSDX          ├───────────────────────────────────────────────┤ USB-C  Cardputer ADV│
+│                   │                                               │                     │
+└───────────────────┘                   5 V supply ─────────────────┤ PORTA 5V / GND      │
+                                                                    │ SW: 5VIN (Right)    │
+                                                                    └─────────────────────┘
+```

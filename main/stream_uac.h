@@ -29,6 +29,9 @@ typedef enum {
 typedef enum {
     UAC_PROFILE_QMX = 0,
     UAC_PROFILE_GENERIC_USB = 1,
+    // FX-4CR: internal hub with a C-Media UAC1 codec plus a USB-serial
+    // bridge (CH34x / CP210x / CDC-ACM) for Kenwood CAT at 115200 baud.
+    UAC_PROFILE_FX4CR = 2,
 } uac_stream_profile_t;
 
 #define UAC_WATERFALL_ROW_WIDTH FT8_AUDIO_WATERFALL_ROW_WIDTH
