@@ -162,6 +162,13 @@ static const uint32_t SPK_PUMP_BYTES       = SPK_PACKET_BYTES * SPK_PUMP_PACKETS
 // C-Media codec is 16-bit. SPK_PUMP_BYTES divides evenly by 2, 3, 4 and 6.
 static uint8_t s_spk_bits = 24;
 static uint8_t s_spk_channels = 2;
+// FX-4CR: the ESP32-S3 host has only 8 channels (one per open endpoint).
+// Hub (2) + codec EP0 (1) + mic (1) + CH340 (4) = 8, so the speaker stream
+// cannot also stay claimed. In this mode the mic and speaker are swapped per
+// TX: mic stopped + speaker started at TX begin, the reverse at TX end.
+static bool s_spk_swap_mode = false;
+static bool s_spk_fmt_known = false;
+static volatile bool s_mic_paused = false;
 static void spk_event_cb(uac_host_device_handle_t dev,
                          const uac_host_device_event_t event,
                          void* arg);
@@ -771,6 +778,11 @@ static void uac_lib_task(void* arg) {
                             const uint8_t (*fmts)[2] = fx ? k_spk_fmt_fx4cr : k_spk_fmt_qmx;
                             const int fmt_count = fx ? 4 : 1;
                             esp_err_t serr = ESP_FAIL;
+                            if (s_spk_swap_mode) {
+                                // Opened only; claimed per TX (see s_spk_swap_mode).
+                                serr = ESP_OK;
+                                ESP_LOGI(TAG, "Speaker opened for per-TX claim (channel budget)");
+                            }
                             for (int f = 0; f < fmt_count && serr != ESP_OK; ++f) {
                                 uac_host_stream_config_t scfg = {};
                                 scfg.channels = fmts[f][0];
@@ -890,6 +902,10 @@ static int uac_read_ft8_samples(void* ctx, float* out, int max_samples) {
     if (!usb_buffer || !out) return 0;
 
     while (!s_stop_requested && s_mic_handle != NULL) {
+        if (s_mic_paused) {
+            vTaskDelay(pdMS_TO_TICKS(20));  // FX-4CR TX: mic released
+            continue;
+        }
         uint32_t bytes_read = 0;
         esp_err_t ret = uac_host_device_read(s_mic_handle, usb_buffer,
                                               UAC_READ_BUFFER_SIZE,
@@ -977,6 +993,9 @@ bool uac_start_with_profile(uac_stream_profile_t profile) {
     snprintf(s_cat_status, sizeof(s_cat_status), "CAT none");
     s_spk_bits = 24;
     s_spk_channels = 2;
+    s_spk_swap_mode = (profile == UAC_PROFILE_FX4CR);
+    s_spk_fmt_known = false;
+    s_mic_paused = false;
     s_format.sample_freq = UAC_SAMPLE_RATE;
     s_format.bit_resolution = UAC_BIT_RESOLUTION;
     s_format.channels = UAC_CHANNELS;
@@ -1081,15 +1100,15 @@ static void spk_event_cb(uac_host_device_handle_t /*dev*/,
 
 static void spk_writer_task(void* /*arg*/) {
     // Permanent task, gated per transmission. The DDS owns symbol timing.
-    // Format is fixed for the writer's lifetime (negotiated at enumeration).
-    const uint32_t frame_bytes = (s_spk_bits / 8u) * s_spk_channels;
-    const uint32_t frames_per_block = SPK_PUMP_BYTES / frame_bytes;
     while (!s_spk_writer_stop) {
         if (!s_spk_writer_run) {
             // Idle between TX cycles. Sleep cheaply.
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
+        // Read per block: in swap mode the format is negotiated at TX start.
+        const uint32_t frame_bytes = (s_spk_bits / 8u) * s_spk_channels;
+        const uint32_t frames_per_block = SPK_PUMP_BYTES / frame_bytes;
         dds_render_pcm(s_spk_pump_buf, frames_per_block, s_spk_bits, s_spk_channels);
         esp_err_t err = uac_host_device_write(s_spk_handle, s_spk_pump_buf, SPK_PUMP_BYTES,
                                               pdMS_TO_TICKS(SPK_WRITE_TIMEOUT_MS));
@@ -1110,6 +1129,62 @@ static void spk_writer_task(void* /*arg*/) {
     vTaskDelete(NULL);
 }
 
+static void mic_resume_after_tx(void) {
+    if (!s_mic_paused) return;
+    if (s_mic_handle) {
+        uac_host_stream_config_t mcfg = {};
+        mcfg.channels = s_format.channels;
+        mcfg.bit_resolution = s_format.bit_resolution;
+        mcfg.sample_freq = s_format.sample_freq;
+        mcfg.flags = 0;
+        esp_err_t err = uac_host_device_start(s_mic_handle, &mcfg);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "mic restart after TX failed: %s", esp_err_to_name(err));
+        }
+    }
+    s_mic_paused = false;
+}
+
+// Swap mode TX start: release the mic's channel, then claim the speaker.
+static bool spk_swap_start(void) {
+    if (s_mic_handle) {
+        s_mic_paused = true;
+        esp_err_t err = uac_host_device_stop(s_mic_handle);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "mic stop before TX failed: %s", esp_err_to_name(err));
+        }
+    }
+
+    static const uint8_t k_fmts[][2] = {{2, 16}, {1, 16}, {2, 24}, {1, 24}};
+    esp_err_t serr = ESP_FAIL;
+    // Last good format first, then the common C-Media layouts.
+    for (int f = -1; f < 4 && serr != ESP_OK; ++f) {
+        if (f == -1 && !s_spk_fmt_known) continue;
+        uac_host_stream_config_t scfg = {};
+        scfg.channels = (f == -1) ? s_spk_channels : k_fmts[f][0];
+        scfg.bit_resolution = (f == -1) ? s_spk_bits : k_fmts[f][1];
+        scfg.sample_freq = 48000;
+        scfg.flags = 0;
+        serr = uac_host_device_start(s_spk_handle, &scfg);
+        if (serr == ESP_OK) {
+            s_spk_channels = scfg.channels;
+            s_spk_bits = scfg.bit_resolution;
+            if (!s_spk_fmt_known) {
+                ESP_LOGI(TAG, "Speaker format 48k/%u-bit/%uch",
+                         (unsigned)s_spk_bits, (unsigned)s_spk_channels);
+            }
+            s_spk_fmt_known = true;
+        }
+    }
+    if (serr != ESP_OK) {
+        ESP_LOGE(TAG, "UAC OUT start failed: %s", esp_err_to_name(serr));
+        mic_resume_after_tx();
+        return false;
+    }
+    s_spk_writer_run = true;
+    return true;
+}
+
 static bool uac_tx_start_writer(void) {
     if (s_spk_writer_run) {
         ESP_LOGW(TAG, "UAC OUT already active");
@@ -1122,6 +1197,10 @@ static bool uac_tx_start_writer(void) {
 
     s_spk_packets_sent = 0;
     s_spk_write_errors = 0;
+
+    if (s_spk_swap_mode) {
+        return spk_swap_start();
+    }
 
     esp_err_t err = uac_host_device_resume(s_spk_handle);
     if (err != ESP_OK) {
@@ -1184,7 +1263,12 @@ void uac_tx_end(void) {
     dds_set_freq_hz(0.0);
 
     if (s_spk_handle) {
-        uac_host_device_suspend(s_spk_handle);
+        if (s_spk_swap_mode) {
+            uac_host_device_stop(s_spk_handle);  // release the channel
+            mic_resume_after_tx();
+        } else {
+            uac_host_device_suspend(s_spk_handle);
+        }
     }
 
     ESP_LOGI(TAG, "UAC OUT stopped packets=%u errors=%u",
