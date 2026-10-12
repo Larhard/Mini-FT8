@@ -125,6 +125,7 @@ static uint16_t s_vcp_vid = 0;
 static uint16_t s_vcp_pid = 0;
 static int s_vcp_iface = 0;
 static char s_cat_status[32] = "CAT none";
+static int s_usb_dev_count = 0;  // devices enumerated (each holds an EP0 channel)
 
 // Debug display buffers
 static char s_debug_line1[64] = "";
@@ -280,7 +281,10 @@ static bool cdc_try_open_vendor_bridge(const cdc_acm_host_device_config_t* dev_c
         cdc_on_opened(handle, s_vcp_iface, how);
         return true;
     }
-    snprintf(s_cat_status, sizeof(s_cat_status), "CAT fail %04x:%04x", s_vcp_vid, s_vcp_pid);
+    // e.g. "CATfail 7523 e106 n3": 0x106 = ESP_ERR_NOT_SUPPORTED = no free
+    // host channel; n = USB devices enumerated (hub, codec, bridge = 3).
+    snprintf(s_cat_status, sizeof(s_cat_status), "CATfail %04x e%x n%d",
+             s_vcp_pid, (unsigned)err, s_usb_dev_count);
     ESP_LOGW(TAG, "%s open VID 0x%04x PID 0x%04x failed: %s",
              how, s_vcp_vid, s_vcp_pid, esp_err_to_name(err));
     return false;
@@ -362,6 +366,7 @@ static void cdc_try_open(void) {
 }
 
 static void cdc_new_dev_cb(usb_device_handle_t usb_dev) {
+    s_usb_dev_count++;
     usb_device_info_t info = {};
     if (usb_host_device_info(usb_dev, &info) == ESP_OK) {
         ESP_LOGI(TAG, "USB dev addr:%u speed:%d", info.dev_addr, info.speed);
@@ -990,6 +995,7 @@ bool uac_start_with_profile(uac_stream_profile_t profile) {
     s_vcp_vid = 0;
     s_vcp_pid = 0;
     s_vcp_iface = 0;
+    s_usb_dev_count = 0;
     snprintf(s_cat_status, sizeof(s_cat_status), "CAT none");
     s_spk_bits = 24;
     s_spk_channels = 2;
