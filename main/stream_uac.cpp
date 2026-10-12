@@ -495,11 +495,31 @@ static void uac_driver_callback(uint8_t addr, uint8_t iface_num,
     xQueueSend(s_event_queue, &evt, 0);
 }
 
+// Enumeration filter. With CONFIG_USB_HOST_ENABLE_ENUM_FILTER_CALLBACK a
+// NULL callback would reject every device, so all profiles install this.
+// FX-4CR: the radio's hub also carries its CSR Bluetooth module (0a12:4007).
+// Every enumerated device permanently holds a host channel for EP0, and the
+// 8 channels cannot fit hub + codec + CH340 + Bluetooth, so it is refused.
+static constexpr uint16_t k_csr_vid = 0x0A12;
+static constexpr uint8_t k_usb_class_wireless = 0xE0;
+
+static bool usb_enum_filter_cb(const usb_device_desc_t* dev_desc, uint8_t* bConfigurationValue) {
+    (void)bConfigurationValue;  // keep the default configuration
+    if (s_profile == UAC_PROFILE_FX4CR && dev_desc &&
+        (dev_desc->idVendor == k_csr_vid || dev_desc->bDeviceClass == k_usb_class_wireless)) {
+        ESP_LOGI(TAG, "Skipping Bluetooth device %04x:%04x (host channel budget)",
+                 dev_desc->idVendor, dev_desc->idProduct);
+        return false;
+    }
+    return true;
+}
+
 // USB host library task
 static void usb_lib_task(void* arg) {
     usb_host_config_t host_config = {};
     host_config.skip_phy_setup = false;
     host_config.intr_flags = ESP_INTR_FLAG_LEVEL1;
+    host_config.enum_filter_cb = usb_enum_filter_cb;
 
     if (profile_has_cat_and_tx_audio(s_profile)) {
         // Custom FIFO partitioning enables simultaneous bidirectional ISO

@@ -588,10 +588,19 @@ static void ctrl_task(void* arg) {
     vTaskDelete(NULL);
 }
 
+// Accept every device. Required: with CONFIG_USB_HOST_ENABLE_ENUM_FILTER_CALLBACK
+// (enabled for the FX-4CR) a NULL filter would reject all devices.
+static bool accept_all_enum_filter(const usb_device_desc_t* dev_desc, uint8_t* bConfigurationValue) {
+    (void)dev_desc;
+    (void)bConfigurationValue;
+    return true;
+}
+
 static void usb_task(void* arg) {
     usb_host_config_t host_config = {};
     host_config.skip_phy_setup = false;
     host_config.intr_flags = ESP_INTR_FLAG_LEVEL1;
+    host_config.enum_filter_cb = accept_all_enum_filter;
     esp_err_t err = usb_host_install(&host_config);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "usb_host_install: %s", esp_err_to_name(err));
