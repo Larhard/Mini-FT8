@@ -2487,6 +2487,11 @@ bool sync_radio_to_current_band(const char* reason) {
 // and S->3 handler cover KH1.
 static void consume_cdc_initial_sync() {
   if (!g_cdc_initial_sync_pending) return;
+  // Retry at most every 2 s: a failing sync otherwise runs every loop pass.
+  static int64_t last_attempt_ms = 0;
+  const int64_t now = rtc_now_ms();
+  if (last_attempt_ms != 0 && now - last_attempt_ms < 2000) return;
+  last_attempt_ms = now;
   if (sync_radio_to_current_band("initial QMX connect")) {
     g_cdc_initial_sync_pending = false;
   }

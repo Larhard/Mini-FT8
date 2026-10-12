@@ -593,6 +593,15 @@ static void usb_lib_task(void* arg) {
     vTaskDelete(NULL);
 }
 
+// FX-4CR: the radio's CSR Bluetooth module (0a12:4007) is also a UAC
+// device. Only the C-Media codec carries the radio's USB audio.
+static bool is_fx4cr_bluetooth_audio(uac_host_device_handle_t handle) {
+    if (s_profile != UAC_PROFILE_FX4CR || !handle) return false;
+    uac_host_dev_info_t info = {};
+    if (uac_host_get_device_info(handle, &info) != ESP_OK) return false;
+    return info.VID == 0x0A12;
+}
+
 // UAC class driver task
 static void uac_lib_task(void* arg) {
     // Wait for USB host to be ready
@@ -649,6 +658,11 @@ static void uac_lib_task(void* arg) {
                     if (err != ESP_OK) {
                         ESP_LOGE(TAG, "Failed to open device: %s", esp_err_to_name(err));
                         snprintf(s_status_string, sizeof(s_status_string), "Open failed");
+                        continue;
+                    }
+                    if (is_fx4cr_bluetooth_audio(handle)) {
+                        ESP_LOGI(TAG, "Ignoring Bluetooth module mic addr:%d", evt.driver.addr);
+                        uac_host_device_close(handle);
                         continue;
                     }
 
@@ -776,6 +790,12 @@ static void uac_lib_task(void* arg) {
                         continue;
                     }
 
+                    if (s_spk_known) {
+                        // e.g. the FX-4CR Bluetooth module's speaker
+                        ESP_LOGI(TAG, "Additional speaker ignored addr=%u",
+                                 (unsigned)evt.driver.addr);
+                        continue;
+                    }
                     s_spk_addr  = evt.driver.addr;
                     s_spk_iface = evt.driver.iface_num;
                     s_spk_known = true;
@@ -785,13 +805,22 @@ static void uac_lib_task(void* arg) {
                     // is contiguous, then hold it across all TX cycles.
                     if (!s_spk_handle) {
                         uac_host_device_config_t cfg = {};
+                        uac_host_device_handle_t probe = NULL;
                         cfg.addr = s_spk_addr;
                         cfg.iface_num = s_spk_iface;
                         cfg.buffer_size = SPK_BUFFER_SIZE;
                         cfg.buffer_threshold = SPK_BUFFER_THRESHOLD;
                         cfg.callback = spk_event_cb;
                         cfg.callback_arg = nullptr;
-                        esp_err_t oerr = uac_host_device_open(&cfg, &s_spk_handle);
+                        esp_err_t oerr = uac_host_device_open(&cfg, &probe);
+                        if (oerr == ESP_OK && is_fx4cr_bluetooth_audio(probe)) {
+                            ESP_LOGI(TAG, "Ignoring Bluetooth module speaker addr=%u",
+                                     (unsigned)s_spk_addr);
+                            uac_host_device_close(probe);
+                            s_spk_known = false;
+                            continue;
+                        }
+                        s_spk_handle = probe;
                         if (oerr != ESP_OK) {
                             ESP_LOGE(TAG, "spk pre-open failed at enum: %s",
                                      esp_err_to_name(oerr));
@@ -951,7 +980,9 @@ static int uac_read_ft8_samples(void* ctx, float* out, int max_samples) {
                                               &bytes_read,
                                               pdMS_TO_TICKS(200));
         if (ret != ESP_OK || bytes_read == 0) {
-            if (ret != ESP_ERR_TIMEOUT && ret != ESP_FAIL) {
+            if (ret == ESP_ERR_INVALID_STATE) {
+                vTaskDelay(pdMS_TO_TICKS(20));  // stream not active (FX-4CR TX/CAT)
+            } else if (ret != ESP_ERR_TIMEOUT && ret != ESP_FAIL) {
                 ESP_LOGW(TAG, "USB read error: %s", esp_err_to_name(ret));
             }
             continue;
@@ -1181,7 +1212,17 @@ static void spk_writer_task(void* /*arg*/) {
 static void mic_pause_for_usb(void) {
     if (s_mic_paused || !s_mic_handle) return;
     s_mic_paused = true;
-    esp_err_t err = uac_host_device_stop(s_mic_handle);
+    // uac_host_device_stop() suspends, then releases the interface. The
+    // release is refused (ESP_ERR_INVALID_STATE) while the just-cancelled
+    // ISO transfers are still in flight / unprocessed by the UAC client
+    // task, which leaves the channel claimed (field log). Retry: the second
+    // call only releases, once the transfers have drained.
+    esp_err_t err = ESP_FAIL;
+    for (int attempt = 0; attempt < 10; ++attempt) {
+        err = uac_host_device_stop(s_mic_handle);
+        if (err == ESP_OK) break;
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "mic stop failed: %s", esp_err_to_name(err));
     }
@@ -1196,6 +1237,10 @@ static void mic_resume_after_tx(void) {
         mcfg.sample_freq = s_format.sample_freq;
         mcfg.flags = 0;
         esp_err_t err = uac_host_device_start(s_mic_handle, &mcfg);
+        // start() returns OK without streaming if a failed stop left the
+        // interface claimed but suspended (READY); resume() covers that and
+        // is a no-op when already ACTIVE.
+        if (err == ESP_OK) err = uac_host_device_resume(s_mic_handle);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "mic restart after TX failed: %s", esp_err_to_name(err));
         }
