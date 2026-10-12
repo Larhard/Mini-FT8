@@ -60,6 +60,14 @@ bool uac_tx_begin_cpfsk(float base_hz,
                         uint32_t samples_per_symbol);
 bool uac_tx_begin_tune(float tone_hz);
 void uac_tx_end(void);
+// As uac_tx_end(); with resume_rx = false the FX-4CR mic stays paused so a
+// following CAT batch (RX;) can use its host channel.
+void uac_tx_end_ex(bool resume_rx);
+// Send CAT commands as one burst. FX-4CR: pauses the mic, opens the bridge,
+// sends, closes it; resume_rx restarts the mic afterwards. Others: plain send.
+esp_err_t uac_cat_batch(const char* const* cmds, size_t count, bool resume_rx);
+// Restart an FX-4CR mic paused for TX / CAT (no-op if not paused).
+void uac_rx_resume(void);
 
 #ifdef __cplusplus
 }

@@ -1,10 +1,14 @@
 // FX-4CR (BG2FX) with F5BUD V2 firmware.
 //
-// USB: internal hub -> C-Media UAC1 codec (RX + TX audio) and a USB-serial
-// bridge for CAT. CAT emulates a Kenwood TS-590S(G) at 115200 8N1; the
-// stream_uac FX-4CR profile opens the bridge and keeps RTS (= PTT) low.
+// USB: internal hub -> C-Media UAC1 codec (RX + TX audio) and a CH340
+// USB-serial bridge for CAT. CAT emulates a Kenwood TS-590S(G) at 115200 8N1.
 // TX audio is only taken from USB in DATA-L/DATA-U, so the radio menu
 // "Digital mode (CAT)" must be DATA (the default) for MD2 to select DATA-U.
+//
+// The ESP32-S3 host has 8 channels; mic + CH340 together exceed them. CAT is
+// therefore sent in bursts (uac_cat_batch: mic paused, bridge opened, sent,
+// closed) and never overlaps the TX audio stream:
+//   TX:  [TX;] (mic stays paused) -> speaker stream ... speaker off -> [RX;] -> mic
 #include "radio_control_backend.h"
 
 #include <cstdio>
@@ -19,24 +23,17 @@ static bool fx4cr_ready(void) {
     return cat_cdc_ready();
 }
 
-static esp_err_t fx4cr_send_cmd(const char* command, uint32_t timeout_ms) {
-    if (!cat_cdc_ready()) return ESP_ERR_INVALID_STATE;
-    return cat_cdc_send(reinterpret_cast<const uint8_t*>(command),
-                        strlen(command), timeout_ms);
+// MD2 = USB, which F5BUD maps to DATA-U when "Digital mode (CAT)" = DATA.
+// DA1 additionally requests TS-590 data mode; ignored if unsupported.
+static esp_err_t fx4cr_send_sync(int freq_hz, bool then_tx, bool resume_rx) {
+    char fa[32];
+    snprintf(fa, sizeof(fa), "FA%011d;", freq_hz);
+    const char* cmds[] = {"MD2;", "DA1;", "FR0;", "FT0;", fa, "TX;"};
+    return uac_cat_batch(cmds, then_tx ? 6 : 5, resume_rx);
 }
 
 static esp_err_t fx4cr_sync_frequency_mode(int freq_hz) {
-    // MD2 = USB, which F5BUD maps to DATA-U when "Digital mode (CAT)" = DATA.
-    // DA1 additionally requests TS-590 data mode; ignored if unsupported.
-    esp_err_t err = fx4cr_send_cmd("MD2;", 200);
-    if (err != ESP_OK) return err;
-    fx4cr_send_cmd("DA1;", 200);
-    fx4cr_send_cmd("FR0;", 200);
-    fx4cr_send_cmd("FT0;", 200);
-
-    char command[32];
-    snprintf(command, sizeof(command), "FA%011d;", freq_hz);
-    err = fx4cr_send_cmd(command, 200);
+    esp_err_t err = fx4cr_send_sync(freq_hz, false, true);
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "FX-4CR sync ok freq=%d", freq_hz);
     }
@@ -46,11 +43,15 @@ static esp_err_t fx4cr_sync_frequency_mode(int freq_hz) {
 static esp_err_t fx4cr_begin_tx(int freq_hz, int tx_base_hz) {
     (void)freq_hz;
     (void)tx_base_hz;
-    esp_err_t err = fx4cr_send_cmd("TX;", 200);
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG, "FX-4CR TX start");
+    // Keep the mic paused: the TX audio stream needs its host channel next.
+    const char* cmds[] = {"TX;"};
+    esp_err_t err = uac_cat_batch(cmds, 1, false);
+    if (err != ESP_OK) {
+        uac_rx_resume();
+        return err;
     }
-    return err;
+    ESP_LOGI(TAG, "FX-4CR TX start");
+    return ESP_OK;
 }
 
 static esp_err_t fx4cr_set_tone_hz(float tone_hz) {
@@ -59,8 +60,9 @@ static esp_err_t fx4cr_set_tone_hz(float tone_hz) {
 }
 
 static esp_err_t fx4cr_end_tx(void) {
-    uac_tx_end();
-    esp_err_t err = fx4cr_send_cmd("RX;", 200);
+    uac_tx_end_ex(false);  // speaker off, mic still paused
+    const char* cmds[] = {"RX;"};
+    esp_err_t err = uac_cat_batch(cmds, 1, true);  // then mic back on
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "FX-4CR TX stop");
     }
@@ -71,12 +73,13 @@ static esp_err_t fx4cr_set_tune(bool enable, int freq_hz, int tone_hz) {
     if (!enable) {
         return fx4cr_end_tx();
     }
-    esp_err_t err = fx4cr_sync_frequency_mode(freq_hz);
-    if (err != ESP_OK) return err;
-    err = fx4cr_send_cmd("TX;", 200);
-    if (err != ESP_OK) return err;
+    esp_err_t err = fx4cr_send_sync(freq_hz, true, false);
+    if (err != ESP_OK) {
+        uac_rx_resume();
+        return err;
+    }
     if (!uac_tx_begin_tune(static_cast<float>(tone_hz))) {
-        fx4cr_send_cmd("RX;", 200);
+        fx4cr_end_tx();
         return ESP_ERR_INVALID_STATE;
     }
     return ESP_OK;

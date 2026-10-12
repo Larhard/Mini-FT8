@@ -126,6 +126,11 @@ static uint16_t s_vcp_pid = 0;
 static int s_vcp_iface = 0;
 static char s_cat_status[32] = "CAT none";
 static int s_usb_dev_count = 0;  // devices enumerated (each holds an EP0 channel)
+// FX-4CR: even with the speaker released, mic + CH340 (4 endpoints) exceed
+// the 8 host channels (CATfail e106 seen). The bridge is therefore opened
+// only for a burst of CAT commands, with the mic paused around it.
+static bool s_fx_cat_announced = false;
+static SemaphoreHandle_t s_cat_lock = NULL;
 
 // Debug display buffers
 static char s_debug_line1[64] = "";
@@ -261,7 +266,19 @@ static bool is_legacy_ch34x_pid(uint16_t pid) {
     return pid == CH340_PID || pid == CH340_PID_1 || pid == CH341_PID;
 }
 
-static bool cdc_try_open_vendor_bridge(const cdc_acm_host_device_config_t* dev_cfg) {
+static esp_err_t fx_bridge_open(const cdc_acm_host_device_config_t* dev_cfg,
+                                cdc_acm_dev_hdl_t* out) {
+    if (s_vcp_vid == 0) return ESP_ERR_NOT_FOUND;
+    if (s_vcp_vid == NANJING_QINHENG_MICROE_VID && is_legacy_ch34x_pid(s_vcp_pid)) {
+        return ch34x_vcp_open(s_vcp_pid, 0, dev_cfg, out);
+    }
+    if (s_vcp_vid == SILICON_LABS_VID) {
+        return cp210x_vcp_open(s_vcp_pid, 0, dev_cfg, out);
+    }
+    return cdc_acm_host_open(s_vcp_vid, s_vcp_pid, (uint8_t)s_vcp_iface, dev_cfg, out);
+}
+
+[[maybe_unused]] static bool cdc_try_open_vendor_bridge(const cdc_acm_host_device_config_t* dev_cfg) {
     if (s_vcp_vid == 0) return false;
     cdc_acm_dev_hdl_t handle = NULL;
     esp_err_t err;
@@ -327,9 +344,13 @@ static void cdc_try_open(void) {
     }
 
     if (s_profile == UAC_PROFILE_FX4CR) {
-        // Never fall through to CDC_HOST_ANY_*: behind the FX-4CR hub it can
-        // match the audio codec rather than the serial bridge.
-        cdc_try_open_vendor_bridge(&dev_cfg);
+        // The bridge is opened per command batch (uac_cat_batch), never held.
+        // Never use CDC_HOST_ANY_* here: behind the hub it can match the codec.
+        if (s_vcp_vid != 0 && !s_fx_cat_announced) {
+            s_fx_cat_announced = true;
+            snprintf(s_cat_status, sizeof(s_cat_status), "CAT %04x:%04x", s_vcp_vid, s_vcp_pid);
+            g_cdc_initial_sync_pending = true;  // main loop syncs band + mode
+        }
         return;
     }
 
@@ -996,6 +1017,8 @@ bool uac_start_with_profile(uac_stream_profile_t profile) {
     s_vcp_pid = 0;
     s_vcp_iface = 0;
     s_usb_dev_count = 0;
+    s_fx_cat_announced = false;
+    if (!s_cat_lock) s_cat_lock = xSemaphoreCreateMutex();
     snprintf(s_cat_status, sizeof(s_cat_status), "CAT none");
     s_spk_bits = 24;
     s_spk_channels = 2;
@@ -1135,6 +1158,16 @@ static void spk_writer_task(void* /*arg*/) {
     vTaskDelete(NULL);
 }
 
+// Stop the mic stream to free its host channel (FX-4CR TX / CAT batch).
+static void mic_pause_for_usb(void) {
+    if (s_mic_paused || !s_mic_handle) return;
+    s_mic_paused = true;
+    esp_err_t err = uac_host_device_stop(s_mic_handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "mic stop failed: %s", esp_err_to_name(err));
+    }
+}
+
 static void mic_resume_after_tx(void) {
     if (!s_mic_paused) return;
     if (s_mic_handle) {
@@ -1153,13 +1186,7 @@ static void mic_resume_after_tx(void) {
 
 // Swap mode TX start: release the mic's channel, then claim the speaker.
 static bool spk_swap_start(void) {
-    if (s_mic_handle) {
-        s_mic_paused = true;
-        esp_err_t err = uac_host_device_stop(s_mic_handle);
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "mic stop before TX failed: %s", esp_err_to_name(err));
-        }
-    }
+    mic_pause_for_usb();  // may already be paused by the TX; CAT batch
 
     static const uint8_t k_fmts[][2] = {{2, 16}, {1, 16}, {2, 24}, {1, 24}};
     esp_err_t serr = ESP_FAIL;
@@ -1257,6 +1284,10 @@ bool uac_tx_begin_tune(float tone_hz) {
 }
 
 void uac_tx_end(void) {
+    uac_tx_end_ex(true);
+}
+
+void uac_tx_end_ex(bool resume_rx) {
     if (!s_spk_writer_run) {
         dds_cpfsk_end();
         dds_set_freq_hz(0.0);
@@ -1271,7 +1302,7 @@ void uac_tx_end(void) {
     if (s_spk_handle) {
         if (s_spk_swap_mode) {
             uac_host_device_stop(s_spk_handle);  // release the channel
-            mic_resume_after_tx();
+            if (resume_rx) mic_resume_after_tx();
         } else {
             uac_host_device_suspend(s_spk_handle);
         }
@@ -1298,10 +1329,66 @@ const char* uac_get_cat_status(void) {
 }
 
 bool cat_cdc_ready(void) {
+    if (s_profile == UAC_PROFILE_FX4CR) return s_fx_cat_announced;
     return s_cdc_handle != NULL;
 }
 
+void uac_rx_resume(void) {
+    mic_resume_after_tx();
+}
+
+esp_err_t uac_cat_batch(const char* const* cmds, size_t count, bool resume_rx) {
+    if (s_profile != UAC_PROFILE_FX4CR) {
+        esp_err_t err = ESP_OK;
+        for (size_t i = 0; i < count && err == ESP_OK; ++i) {
+            err = cat_cdc_send(reinterpret_cast<const uint8_t*>(cmds[i]), strlen(cmds[i]), 200);
+        }
+        return err;
+    }
+    if (!s_cdc_installed || s_vcp_vid == 0) return ESP_ERR_INVALID_STATE;
+    if (s_spk_writer_run) return ESP_ERR_INVALID_STATE;  // speaker holds a channel
+    if (s_cat_lock) xSemaphoreTake(s_cat_lock, portMAX_DELAY);
+
+    mic_pause_for_usb();
+    cdc_acm_host_device_config_t dev_cfg = {
+        .connection_timeout_ms = 500,
+        .out_buffer_size = 64,
+        .in_buffer_size = 0,
+        .event_cb = NULL,
+        .data_cb = NULL,
+        .user_arg = NULL,
+    };
+    cdc_acm_dev_hdl_t h = NULL;
+    esp_err_t err = fx_bridge_open(&dev_cfg, &h);
+    if (err == ESP_OK) {
+        cdc_configure_fx4cr_line(h);
+        for (size_t i = 0; i < count && err == ESP_OK; ++i) {
+            err = cdc_acm_host_data_tx_blocking(h, reinterpret_cast<const uint8_t*>(cmds[i]),
+                                                strlen(cmds[i]), 200);
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));  // let the bridge shift the last bytes out
+        cdc_acm_host_close(h);
+    }
+    if (err == ESP_OK) {
+        snprintf(s_cat_status, sizeof(s_cat_status), "CAT ok %04x:%04x", s_vcp_vid, s_vcp_pid);
+    } else {
+        snprintf(s_cat_status, sizeof(s_cat_status), "CATerr %04x e%x", s_vcp_pid, (unsigned)err);
+        ESP_LOGW(TAG, "FX-4CR CAT batch failed: %s", esp_err_to_name(err));
+    }
+    if (resume_rx) mic_resume_after_tx();
+    if (s_cat_lock) xSemaphoreGive(s_cat_lock);
+    return err;
+}
+
 esp_err_t cat_cdc_send(const uint8_t* data, size_t len, uint32_t timeout_ms) {
+    if (s_profile == UAC_PROFILE_FX4CR) {
+        char cmd[64];
+        if (len >= sizeof(cmd)) return ESP_ERR_INVALID_SIZE;
+        memcpy(cmd, data, len);
+        cmd[len] = '\0';
+        const char* one[] = {cmd};
+        return uac_cat_batch(one, 1, true);
+    }
     if (!s_cdc_handle) {
         return ESP_ERR_INVALID_STATE;
     }
