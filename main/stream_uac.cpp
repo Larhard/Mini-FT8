@@ -117,9 +117,14 @@ static int64_t s_cdc_last_attempt_ms = 0;
 static constexpr uint16_t k_qmx_vid = 0x0483;
 static constexpr uint16_t k_qmx_pid = 0xA34C;
 static constexpr uint32_t k_fx4cr_cat_baud = 115200;
-// VID/PID of a vendor USB-serial bridge seen during enumeration (FX-4CR).
+// FX-4CR: the USB-serial bridge seen behind the radio's hub. Any device
+// with a CDC or vendor-specific interface that is not the audio codec or a
+// hub is a candidate. Opened by exact VID/PID: CDC_HOST_ANY_* behind a hub
+// may pick the codec instead.
 static uint16_t s_vcp_vid = 0;
 static uint16_t s_vcp_pid = 0;
+static int s_vcp_iface = 0;
+static char s_cat_status[32] = "CAT none";
 
 // Debug display buffers
 static char s_debug_line1[64] = "";
@@ -242,22 +247,33 @@ static void cdc_on_opened(cdc_acm_dev_hdl_t handle, int iface, const char* how) 
 
 // FX-4CR: open the vendor USB-serial bridge seen during enumeration.
 // Only the VID/PID actually present is tried, so absent bridges cost nothing.
+static bool is_legacy_ch34x_pid(uint16_t pid) {
+    // CH340/CH341 use vendor requests for baud rate. Newer WCH parts with the
+    // same VID (e.g. CH9102, PID 0x55D4) are CDC-ACM compliant instead.
+    return pid == CH340_PID || pid == CH340_PID_1 || pid == CH341_PID;
+}
+
 static bool cdc_try_open_vendor_bridge(const cdc_acm_host_device_config_t* dev_cfg) {
     if (s_vcp_vid == 0) return false;
     cdc_acm_dev_hdl_t handle = NULL;
-    esp_err_t err = ESP_ERR_NOT_SUPPORTED;
-    const char* how = "bridge";
-    if (s_vcp_vid == NANJING_QINHENG_MICROE_VID) {
+    esp_err_t err;
+    const char* how;
+    if (s_vcp_vid == NANJING_QINHENG_MICROE_VID && is_legacy_ch34x_pid(s_vcp_pid)) {
         how = "CH34x";
         err = ch34x_vcp_open(s_vcp_pid, 0, dev_cfg, &handle);
     } else if (s_vcp_vid == SILICON_LABS_VID) {
         how = "CP210x";
         err = cp210x_vcp_open(s_vcp_pid, 0, dev_cfg, &handle);
+    } else {
+        how = "CDC";
+        err = cdc_acm_host_open(s_vcp_vid, s_vcp_pid, (uint8_t)s_vcp_iface, dev_cfg, &handle);
     }
     if (err == ESP_OK) {
-        cdc_on_opened(handle, 0, how);
+        snprintf(s_cat_status, sizeof(s_cat_status), "CAT %s %04x:%04x", how, s_vcp_vid, s_vcp_pid);
+        cdc_on_opened(handle, s_vcp_iface, how);
         return true;
     }
+    snprintf(s_cat_status, sizeof(s_cat_status), "CAT fail %04x:%04x", s_vcp_vid, s_vcp_pid);
     ESP_LOGW(TAG, "%s open VID 0x%04x PID 0x%04x failed: %s",
              how, s_vcp_vid, s_vcp_pid, esp_err_to_name(err));
     return false;
@@ -299,7 +315,10 @@ static void cdc_try_open(void) {
         }
     }
 
-    if (s_profile == UAC_PROFILE_FX4CR && cdc_try_open_vendor_bridge(&dev_cfg)) {
+    if (s_profile == UAC_PROFILE_FX4CR) {
+        // Never fall through to CDC_HOST_ANY_*: behind the FX-4CR hub it can
+        // match the audio codec rather than the serial bridge.
+        cdc_try_open_vendor_bridge(&dev_cfg);
         return;
     }
 
@@ -345,13 +364,11 @@ static void cdc_new_dev_cb(usb_device_handle_t usb_dev) {
     if (usb_host_get_device_descriptor(usb_dev, &dev_desc) == ESP_OK && dev_desc) {
         ESP_LOGI(TAG, "USB dev attached: VID:0x%04x PID:0x%04x cfgs:%u",
                  dev_desc->idVendor, dev_desc->idProduct, dev_desc->bNumConfigurations);
-        if (dev_desc->idVendor == NANJING_QINHENG_MICROE_VID ||
-            dev_desc->idVendor == SILICON_LABS_VID) {
-            s_vcp_vid = dev_desc->idVendor;
-            s_vcp_pid = dev_desc->idProduct;
-            ESP_LOGI(TAG, "  -> USB-serial bridge candidate");
-        }
     }
+
+    bool has_audio = false;
+    int comm_iface = -1;
+    int vendor_iface = -1;
 
     const usb_config_desc_t* cfg = nullptr;
     if (usb_host_get_active_config_descriptor(usb_dev, &cfg) == ESP_OK && cfg) {
@@ -371,8 +388,30 @@ static void cdc_new_dev_cb(usb_device_handle_t usb_dev) {
                     s_cdc_iface_hint = intf->bInterfaceNumber;
                     ESP_LOGI(TAG, "  -> CDC candidate iface %d", s_cdc_iface_hint);
                 }
+                if (intf->bInterfaceClass == USB_CLASS_AUDIO) has_audio = true;
+                if (intf->bInterfaceClass == USB_CLASS_COMM && comm_iface < 0) {
+                    comm_iface = intf->bInterfaceNumber;
+                }
+                if (intf->bInterfaceClass == USB_CLASS_VENDOR_SPEC && vendor_iface < 0) {
+                    vendor_iface = intf->bInterfaceNumber;
+                }
             }
             offset += len;
+        }
+    }
+
+    // Remember the serial bridge: not the codec, not a hub, and either a known
+    // bridge VID or a CDC / vendor-specific interface.
+    if (dev_desc && !has_audio && dev_desc->bDeviceClass != USB_CLASS_HUB) {
+        const bool known_vid = dev_desc->idVendor == NANJING_QINHENG_MICROE_VID ||
+                               dev_desc->idVendor == SILICON_LABS_VID;
+        if (known_vid || comm_iface >= 0 || vendor_iface >= 0) {
+            s_vcp_vid = dev_desc->idVendor;
+            s_vcp_pid = dev_desc->idProduct;
+            s_vcp_iface = comm_iface >= 0 ? comm_iface : (vendor_iface >= 0 ? vendor_iface : 0);
+            snprintf(s_cat_status, sizeof(s_cat_status), "CAT seen %04x:%04x",
+                     s_vcp_vid, s_vcp_pid);
+            ESP_LOGI(TAG, "  -> USB-serial bridge candidate iface %d", s_vcp_iface);
         }
     }
 }
@@ -934,6 +973,8 @@ bool uac_start_with_profile(uac_stream_profile_t profile) {
     s_cdc_iface_hint = -1;
     s_vcp_vid = 0;
     s_vcp_pid = 0;
+    s_vcp_iface = 0;
+    snprintf(s_cat_status, sizeof(s_cat_status), "CAT none");
     s_spk_bits = 24;
     s_spk_channels = 2;
     s_format.sample_freq = UAC_SAMPLE_RATE;
@@ -1160,6 +1201,10 @@ const char* uac_get_debug_line1(void) {
 
 const char* uac_get_debug_line2(void) {
     return s_debug_line2;
+}
+
+const char* uac_get_cat_status(void) {
+    return s_cat_status;
 }
 
 bool cat_cdc_ready(void) {
