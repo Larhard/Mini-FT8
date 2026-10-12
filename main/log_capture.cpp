@@ -60,9 +60,7 @@ bool log_capture_dump(const char* name) {
     taskEXIT_CRITICAL(&s_lock);
     // Not locked while copying: a concurrent line may tear, which is fine
     // for a diagnostic dump and keeps the critical section short.
-    out.append("
-===== log dump =====
-");
+    out.append("\n===== log dump =====\n");
     if (wrapped) out.append(s_ring + head, k_ring_size - head);
     out.append(s_ring, head);
     // Append, not storage_file_write_atomic(): internal FATFS has no long
