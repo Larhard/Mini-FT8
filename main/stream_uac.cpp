@@ -136,7 +136,8 @@ static char s_cat_line[32];
 // the 8 host channels (CATfail e106 seen). The bridge is therefore opened
 // only for a burst of CAT commands, with the mic paused around it.
 static bool s_fx_cat_announced = false;
-static int64_t s_cat_fail_ms = 0;   // throttle: auto-sync retries every loop
+static int64_t s_cat_fail_ms = 0;   // last failed CAT burst
+static int s_cat_fail_count = 0;    // consecutive failures, for back-off
 static bool s_cat_log_dumped = false;
 static constexpr char k_usb_log_file[] = "USBLOG.txt";
 static SemaphoreHandle_t s_cat_lock = NULL;
@@ -1063,6 +1064,7 @@ bool uac_start_with_profile(uac_stream_profile_t profile) {
     s_usb_dev_count = 0;
     s_fx_cat_announced = false;
     s_cat_fail_ms = 0;
+    s_cat_fail_count = 0;
     s_cat_log_dumped = false;
     if (profile == UAC_PROFILE_FX4CR) log_capture_start();
     if (!s_cat_lock) s_cat_lock = xSemaphoreCreateMutex();
@@ -1410,6 +1412,10 @@ void uac_rx_resume(void) {
 }
 
 esp_err_t uac_cat_batch(const char* const* cmds, size_t count, bool resume_rx) {
+    return uac_cat_batch_ex(cmds, count, resume_rx, false);
+}
+
+esp_err_t uac_cat_batch_ex(const char* const* cmds, size_t count, bool resume_rx, bool urgent) {
     if (s_profile != UAC_PROFILE_FX4CR) {
         esp_err_t err = ESP_OK;
         for (size_t i = 0; i < count && err == ESP_OK; ++i) {
@@ -1419,8 +1425,13 @@ esp_err_t uac_cat_batch(const char* const* cmds, size_t count, bool resume_rx) {
     }
     if (!s_cdc_installed || s_vcp_vid == 0) return ESP_ERR_INVALID_STATE;
     if (s_spk_writer_run) return ESP_ERR_INVALID_STATE;  // speaker holds a channel
-    // After a failure, back off instead of pausing the mic on every loop pass.
-    if (s_cat_fail_ms != 0 && rtc_now_ms() - s_cat_fail_ms < 3000) return ESP_ERR_INVALID_STATE;
+    // Every burst pauses RX audio; a failing link retried often makes the
+    // waterfall choppy and kills decodes. Back off 3, 6, 12, 24 s ... 60 s.
+    if (s_cat_fail_count > 0 && !urgent) {
+        int64_t backoff_ms = 3000LL << (s_cat_fail_count > 5 ? 5 : s_cat_fail_count - 1);
+        if (backoff_ms > 60000) backoff_ms = 60000;
+        if (rtc_now_ms() - s_cat_fail_ms < backoff_ms) return ESP_ERR_INVALID_STATE;
+    }
     if (s_cat_lock) xSemaphoreTake(s_cat_lock, portMAX_DELAY);
 
     mic_pause_for_usb();
@@ -1450,6 +1461,7 @@ esp_err_t uac_cat_batch(const char* const* cmds, size_t count, bool resume_rx) {
         ESP_LOGW(TAG, "FX-4CR CAT batch failed: %s (mic_paused=%d)",
                  esp_err_to_name(err), (int)s_mic_paused);
         s_cat_fail_ms = rtc_now_ms();
+        s_cat_fail_count++;
     }
     if (resume_rx) mic_resume_after_tx();
     if (s_cat_lock) xSemaphoreGive(s_cat_lock);
@@ -1458,6 +1470,7 @@ esp_err_t uac_cat_batch(const char* const* cmds, size_t count, bool resume_rx) {
         log_capture_dump(k_usb_log_file);
     } else if (err == ESP_OK) {
         s_cat_fail_ms = 0;
+        s_cat_fail_count = 0;
     }
     return err;
 }

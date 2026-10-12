@@ -66,6 +66,8 @@ void uac_tx_end_ex(bool resume_rx);
 // Send CAT commands as one burst. FX-4CR: pauses the mic, opens the bridge,
 // sends, closes it; resume_rx restarts the mic afterwards. Others: plain send.
 esp_err_t uac_cat_batch(const char* const* cmds, size_t count, bool resume_rx);
+// urgent = true ignores the failure back-off (used for RX; to unkey).
+esp_err_t uac_cat_batch_ex(const char* const* cmds, size_t count, bool resume_rx, bool urgent);
 // Restart an FX-4CR mic paused for TX / CAT (no-op if not paused).
 void uac_rx_resume(void);
 

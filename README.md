@@ -199,6 +199,12 @@ Mini-FT8 enables USB hub support and opens CH34x, CP210x or CDC-ACM bridges auto
   - Keep `RTS as PTT` in mind: Mini-FT8 holds RTS and DTR low.
   - Adjust `Aux-Input-Level` / `Aux-Output-Level` (Usb & Bt) for a clean TX signal and sensible RX level.
 - TX uses CAT `TX;` / `RX;`, plus a 48 kHz FT8/FT4 waveform on the USB sound card, the same as QDX.
+- The radio's hub carries three devices: the C-Media sound card (`0d8c:013c`), a CH340 for CAT (`1a86:7523`) and a CSR Bluetooth module (`0a12:4007`).
+  - The Cardputer's USB host has only 8 channels, and that is not enough to keep everything open. So the CAT link is opened only for a short burst of commands. RX audio pauses for a fraction of a second during each burst: at connect, at each band change, and at TX start/end.
+  - The Bluetooth module's audio is ignored.
+- The STATUS line shows the CAT state (`CAT ok 1a86:7523`, or `CATerr e<code> n<devices>`), alternating with the list of detected USB devices.
+  - If CAT fails, retries back off (3 s up to 60 s), and the automatic sync stops after 3 attempts so RX keeps decoding. Press `S` -> `2` to retry.
+  - Diagnostic USB logs are appended to `USBLOG.txt`. Copy them to SD with `O` -> `5` after switching to another radio type.
 
 ```text
 ┌───────────────────┐   USB (hub: C-Media audio + serial bridge)   ┌─────────────────────┐

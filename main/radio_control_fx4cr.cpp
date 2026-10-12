@@ -15,9 +15,16 @@
 #include <cstring>
 
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "stream_uac.h"
 
 static const char* TAG = "RADIO_FX4CR";
+
+// True while we have keyed the radio (TX;). end_tx() is also called as a
+// precaution before every band sync; skipping RX; when not keyed saves a
+// CAT burst, i.e. one RX audio pause.
+static bool s_keyed = false;
 
 static bool fx4cr_ready(void) {
     return cat_cdc_ready();
@@ -50,6 +57,7 @@ static esp_err_t fx4cr_begin_tx(int freq_hz, int tx_base_hz) {
         uac_rx_resume();
         return err;
     }
+    s_keyed = true;
     ESP_LOGI(TAG, "FX-4CR TX start");
     return ESP_OK;
 }
@@ -60,11 +68,24 @@ static esp_err_t fx4cr_set_tone_hz(float tone_hz) {
 }
 
 static esp_err_t fx4cr_end_tx(void) {
+    if (!s_keyed) {
+        uac_tx_end_ex(true);  // nothing keyed: just make sure RX audio runs
+        return ESP_OK;
+    }
     uac_tx_end_ex(false);  // speaker off, mic still paused
+    // Unkeying must never be throttled or dropped: bypass the back-off and
+    // retry, or the radio would stay in TX.
     const char* cmds[] = {"RX;"};
-    esp_err_t err = uac_cat_batch(cmds, 1, true);  // then mic back on
+    esp_err_t err = ESP_FAIL;
+    for (int attempt = 0; attempt < 3 && err != ESP_OK; ++attempt) {
+        if (attempt > 0) vTaskDelay(pdMS_TO_TICKS(100));
+        err = uac_cat_batch_ex(cmds, 1, true, true);  // then mic back on
+    }
     if (err == ESP_OK) {
+        s_keyed = false;
         ESP_LOGI(TAG, "FX-4CR TX stop");
+    } else {
+        uac_rx_resume();
     }
     return err;
 }
@@ -78,6 +99,7 @@ static esp_err_t fx4cr_set_tune(bool enable, int freq_hz, int tone_hz) {
         uac_rx_resume();
         return err;
     }
+    s_keyed = true;
     if (!uac_tx_begin_tune(static_cast<float>(tone_hz))) {
         fx4cr_end_tx();
         return ESP_ERR_INVALID_STATE;

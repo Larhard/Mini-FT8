@@ -2492,8 +2492,16 @@ static void consume_cdc_initial_sync() {
   const int64_t now = rtc_now_ms();
   if (last_attempt_ms != 0 && now - last_attempt_ms < 2000) return;
   last_attempt_ms = now;
+  static int fx4cr_failures = 0;
   if (sync_radio_to_current_band("initial QMX connect")) {
     g_cdc_initial_sync_pending = false;
+    fx4cr_failures = 0;
+  } else if (canonical_radio_type(g_radio) == RadioType::FX4CR && ++fx4cr_failures >= 3) {
+    // Each FX-4CR attempt pauses RX audio; stop retrying so decoding keeps
+    // working. S->2 retries manually.
+    g_cdc_initial_sync_pending = false;
+    fx4cr_failures = 0;
+    debug_log_line("FX-4CR CAT sync gave up");
   }
 }
 
