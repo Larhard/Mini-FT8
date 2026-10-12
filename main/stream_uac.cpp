@@ -126,6 +126,11 @@ static uint16_t s_vcp_pid = 0;
 static int s_vcp_iface = 0;
 static char s_cat_status[32] = "CAT none";
 static int s_usb_dev_count = 0;  // devices enumerated (each holds an EP0 channel)
+// VID/PID of every enumerated device, for the STATUS line inventory.
+static constexpr int k_usb_inv_max = 8;
+static uint16_t s_usb_inv_vid[k_usb_inv_max];
+static uint16_t s_usb_inv_pid[k_usb_inv_max];
+static char s_cat_line[32];
 // FX-4CR: even with the speaker released, mic + CH340 (4 endpoints) exceed
 // the 8 host channels (CATfail e106 seen). The bridge is therefore opened
 // only for a burst of CAT commands, with the mic paused around it.
@@ -387,7 +392,6 @@ static void cdc_try_open(void) {
 }
 
 static void cdc_new_dev_cb(usb_device_handle_t usb_dev) {
-    s_usb_dev_count++;
     usb_device_info_t info = {};
     if (usb_host_device_info(usb_dev, &info) == ESP_OK) {
         ESP_LOGI(TAG, "USB dev addr:%u speed:%d", info.dev_addr, info.speed);
@@ -397,7 +401,12 @@ static void cdc_new_dev_cb(usb_device_handle_t usb_dev) {
     if (usb_host_get_device_descriptor(usb_dev, &dev_desc) == ESP_OK && dev_desc) {
         ESP_LOGI(TAG, "USB dev attached: VID:0x%04x PID:0x%04x cfgs:%u",
                  dev_desc->idVendor, dev_desc->idProduct, dev_desc->bNumConfigurations);
+        if (s_usb_dev_count < k_usb_inv_max) {
+            s_usb_inv_vid[s_usb_dev_count] = dev_desc->idVendor;
+            s_usb_inv_pid[s_usb_dev_count] = dev_desc->idProduct;
+        }
     }
+    s_usb_dev_count++;
 
     bool has_audio = false;
     int comm_iface = -1;
@@ -1324,8 +1333,16 @@ const char* uac_get_debug_line2(void) {
     return s_debug_line2;
 }
 
+// Alternates every 3 s: CAT state, then each enumerated device on its own
+// page ("2/4 1a86:7523") so the inventory fits the 19-char STATUS line.
 const char* uac_get_cat_status(void) {
-    return s_cat_status;
+    const int shown = s_usb_dev_count < k_usb_inv_max ? s_usb_dev_count : k_usb_inv_max;
+    const int page = (int)((rtc_now_ms() / 3000) % (1 + shown));
+    if (page == 0) return s_cat_status;
+    const int i = page - 1;
+    snprintf(s_cat_line, sizeof(s_cat_line), "%d/%d %04x:%04x", page, s_usb_dev_count,
+             s_usb_inv_vid[i], s_usb_inv_pid[i]);
+    return s_cat_line;
 }
 
 bool cat_cdc_ready(void) {
@@ -1372,7 +1389,7 @@ esp_err_t uac_cat_batch(const char* const* cmds, size_t count, bool resume_rx) {
     if (err == ESP_OK) {
         snprintf(s_cat_status, sizeof(s_cat_status), "CAT ok %04x:%04x", s_vcp_vid, s_vcp_pid);
     } else {
-        snprintf(s_cat_status, sizeof(s_cat_status), "CATerr %04x e%x", s_vcp_pid, (unsigned)err);
+        snprintf(s_cat_status, sizeof(s_cat_status), "CATerr e%x n%d", (unsigned)err, s_usb_dev_count);
         ESP_LOGW(TAG, "FX-4CR CAT batch failed: %s", esp_err_to_name(err));
     }
     if (resume_rx) mic_resume_after_tx();
