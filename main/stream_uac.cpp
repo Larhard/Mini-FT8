@@ -4,6 +4,7 @@
 #include "dds_q15.h"
 #include "feature_flags.h"
 #include "protocol.h"
+#include "log_capture.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -135,6 +136,9 @@ static char s_cat_line[32];
 // the 8 host channels (CATfail e106 seen). The bridge is therefore opened
 // only for a burst of CAT commands, with the mic paused around it.
 static bool s_fx_cat_announced = false;
+static int64_t s_cat_fail_ms = 0;   // throttle: auto-sync retries every loop
+static bool s_cat_log_dumped = false;
+static constexpr char k_usb_log_file[] = "USBLOG.txt";
 static SemaphoreHandle_t s_cat_lock = NULL;
 
 // Debug display buffers
@@ -1027,6 +1031,9 @@ bool uac_start_with_profile(uac_stream_profile_t profile) {
     s_vcp_iface = 0;
     s_usb_dev_count = 0;
     s_fx_cat_announced = false;
+    s_cat_fail_ms = 0;
+    s_cat_log_dumped = false;
+    if (profile == UAC_PROFILE_FX4CR) log_capture_start();
     if (!s_cat_lock) s_cat_lock = xSemaphoreCreateMutex();
     snprintf(s_cat_status, sizeof(s_cat_status), "CAT none");
     s_spk_bits = 24;
@@ -1096,6 +1103,9 @@ void uac_stop(void) {
     }
 
     ESP_LOGI(TAG, "Stopping UAC host");
+    if (s_profile == UAC_PROFILE_FX4CR) {
+        log_capture_dump(k_usb_log_file);  // copy to SD later with O->5
+    }
     s_stop_requested = true;
     g_streaming = false;
     cdc_close();
@@ -1364,6 +1374,8 @@ esp_err_t uac_cat_batch(const char* const* cmds, size_t count, bool resume_rx) {
     }
     if (!s_cdc_installed || s_vcp_vid == 0) return ESP_ERR_INVALID_STATE;
     if (s_spk_writer_run) return ESP_ERR_INVALID_STATE;  // speaker holds a channel
+    // After a failure, back off instead of pausing the mic on every loop pass.
+    if (s_cat_fail_ms != 0 && rtc_now_ms() - s_cat_fail_ms < 3000) return ESP_ERR_INVALID_STATE;
     if (s_cat_lock) xSemaphoreTake(s_cat_lock, portMAX_DELAY);
 
     mic_pause_for_usb();
@@ -1390,10 +1402,18 @@ esp_err_t uac_cat_batch(const char* const* cmds, size_t count, bool resume_rx) {
         snprintf(s_cat_status, sizeof(s_cat_status), "CAT ok %04x:%04x", s_vcp_vid, s_vcp_pid);
     } else {
         snprintf(s_cat_status, sizeof(s_cat_status), "CATerr e%x n%d", (unsigned)err, s_usb_dev_count);
-        ESP_LOGW(TAG, "FX-4CR CAT batch failed: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "FX-4CR CAT batch failed: %s (mic_paused=%d)",
+                 esp_err_to_name(err), (int)s_mic_paused);
+        s_cat_fail_ms = rtc_now_ms();
     }
     if (resume_rx) mic_resume_after_tx();
     if (s_cat_lock) xSemaphoreGive(s_cat_lock);
+    if (err != ESP_OK && !s_cat_log_dumped) {
+        s_cat_log_dumped = true;  // first failure: keep the context on flash
+        log_capture_dump(k_usb_log_file);
+    } else if (err == ESP_OK) {
+        s_cat_fail_ms = 0;
+    }
     return err;
 }
 
