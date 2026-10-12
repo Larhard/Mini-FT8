@@ -60,7 +60,13 @@ bool log_capture_dump(const char* name) {
     taskEXIT_CRITICAL(&s_lock);
     // Not locked while copying: a concurrent line may tear, which is fine
     // for a diagnostic dump and keeps the critical section short.
+    out.append("
+===== log dump =====
+");
     if (wrapped) out.append(s_ring + head, k_ring_size - head);
     out.append(s_ring, head);
-    return storage_file_write_atomic(name, out);
+    // Append, not storage_file_write_atomic(): internal FATFS has no long
+    // file names (CONFIG_FATFS_LFN_NONE), so its "<name>.tmp" temp file
+    // cannot be created for names like USBLOG.txt.
+    return storage_file_append(name, out, "", true);
 }
