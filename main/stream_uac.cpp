@@ -541,6 +541,10 @@ static esp_err_t fx_ch340_write(const char* const* cmds, size_t count) {
             err = ESP_ERR_INVALID_SIZE;
             break;
         }
+        // Give the radio time to act on each command: right after MD/DA it is
+        // busy and a following TX1; was dropped (field: MD2;DA1;TX1; did not
+        // key, the tune burst with three commands in between did).
+        if (i > 0) vTaskDelay(pdMS_TO_TICKS(15));
         memcpy(bulk->data_buffer, cmds[i], len);
         bulk->num_bytes = (int)len;
         err = fx_run_xfer(client, bulk, false);
