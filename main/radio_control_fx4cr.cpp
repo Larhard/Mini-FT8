@@ -5,9 +5,9 @@
 // TX audio is only taken from USB in DATA-L/DATA-U, so the radio menu
 // "Digital mode (CAT)" must be DATA (the default) for MD2 to select DATA-U.
 //
-// The ESP32-S3 host has 8 channels; mic + CH340 together exceed them. CAT is
-// therefore sent in bursts (uac_cat_batch: mic paused, bridge opened, sent,
-// closed) and never overlaps the TX audio stream:
+// The ESP32-S3 USB host has 8 channels and this radio leaves only one free
+// (see stream_uac.cpp). CAT is therefore sent in bursts (uac_cat_batch: mic
+// paused, bridge opened, sent, closed) and never overlaps the TX audio:
 //   TX:  [TX;] (mic stays paused) -> speaker stream ... speaker off -> [RX;] -> mic
 #include "radio_control_backend.h"
 
@@ -28,8 +28,7 @@ static bool s_keyed = false;
 
 // TS-590 "TX1;" = DATA SEND (audio from USB/ACC2); plain "TX;" is SEND with
 // the mic as audio source. F5BUD documents WSJT-X with rig TS-590S and
-// mode Data/Pkt, for which Hamlib keys with TX1. Field test: "TX;" with the
-// UAC stream running produced no RF.
+// mode Data/Pkt, for which Hamlib keys with TX1.
 static const char k_tx_cmd[] = "TX1;";
 
 static bool fx4cr_ready(void) {

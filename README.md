@@ -186,25 +186,22 @@ updates write the DS3231 when it is present; FT8 decode fine corrections do not.
 
 ## FX-4CR (F5BUD firmware) Connections
 
-The FX-4CR's USB port is an internal USB hub. Behind it sit a C-Media USB sound card
-(RX and TX audio) and a USB-serial bridge for CAT. The CAT is Kenwood TS-590S at 115200 baud.
-Mini-FT8 enables USB hub support and opens CH34x, CP210x or CDC-ACM bridges automatically.
+The FX-4CR's USB port leads to internal USB hubs. Behind them are a C-Media USB sound card (RX and TX audio),
+a CH340 USB-serial bridge for CAT (Kenwood TS-590S protocol, 115200 baud) and a Bluetooth module.
 
-- Select `FX-4CR` in MENU P2 (`N` -> `3`).
+- Select `FX-4CR` in MENU P2 (`N` -> `3`), then connect with `S` -> `2`.
 - Power the radio from its own 12 V supply (XT60) as usual. The USB port does not power the radio.
-- A USB host must provide 5 V on the cable, which the radio's internal hub, sound card and serial bridge use. Supply 5 V from an external source (power bank/adapter) to PORTA and **set the micro switch to the right** (5VIN), the same as for KH1-USBC. The Cardputer passes this through to USB-C; its battery is not used.
+- A USB host must provide 5 V on the cable for the radio's hub, sound card and serial bridge. Supply 5 V from an external source (power bank/adapter) to PORTA and **set the micro switch to the right** (5VIN), the same as for KH1-USBC. The Cardputer passes this 5 V through to USB-C.
 - Use the radio's own USB cable: TRRS-to-USB-A on V/VR units, USB-C on R units. Add a USB-A (female) to USB-C (male) OTG adapter for the Cardputer.
 - Radio settings:
-  - `Digital mode (CAT)` = `DATA` (the default). Mini-FT8 sends `MD2;`, which the F5BUD firmware then maps to DATA-U. In DATA-L/U the radio takes TX audio from USB.
-  - Keep `RTS as PTT` in mind: Mini-FT8 holds RTS and DTR low.
-  - Adjust `Aux-Input-Level` / `Aux-Output-Level` (Usb & Bt) for a clean TX signal and sensible RX level.
-- TX uses CAT `TX;` / `RX;`, plus a 48 kHz FT8/FT4 waveform on the USB sound card, the same as QDX.
-- The radio's hub carries three devices: the C-Media sound card (`0d8c:013c`), a CH340 for CAT (`1a86:7523`) and a CSR Bluetooth module (`0a12:4007`).
-  - The Cardputer's USB host has only 8 channels, and that is not enough to keep everything open. So the CAT link is opened only for a short burst of commands. RX audio pauses for a fraction of a second during each burst: at connect, at each band change, and at TX start/end.
-  - The Bluetooth module's audio is ignored.
-- The STATUS line shows the CAT state (`CAT ok 1a86:7523`, or `CATerr e<code> n<devices>`), alternating with the list of detected USB devices.
-  - If CAT fails, retries back off (3 s up to 60 s), and the automatic sync stops after 3 attempts so RX keeps decoding. Press `S` -> `2` to retry.
-  - Diagnostic USB logs are appended to `USBLOG.txt`. Copy them to SD with `O` -> `5` after switching to another radio type.
+  - `Digital mode (CAT)` = `DATA` (the default). Mini-FT8 sends `MD2;`, which the F5BUD firmware maps to DATA-U. Only in DATA-L/U does the radio take TX audio from USB.
+  - Mini-FT8 holds RTS and DTR low, so `RTS as PTT` does not key the radio.
+  - Adjust `Aux-Input-Level` / `Aux-Output-Level` (Usb & Bt) for a clean TX signal and a sensible RX level.
+- TX keys with CAT `TX1;` (data send) and plays a 48 kHz FT8/FT4 waveform on the USB sound card, the same as QDX. `RX;` ends the transmission.
+- The ESP32-S3 USB host has only 8 channels, and the radio's hubs and devices permanently use 7 of them. Mini-FT8 therefore takes turns with the last one:
+  - CAT commands are sent in short bursts, at connect, at each band change and at TX start/end. RX audio pauses for a fraction of a second during each burst.
+  - The Bluetooth module's audio device is ignored.
+- STATUS line 2 shows the CAT state: `CAT ok 1a86:7523` after a successful command burst, or `CATerr <error>`. After a failure, retries back off from 3 s up to 60 s, and the automatic sync stops after 3 attempts so RX keeps decoding. Press `S` -> `2` to retry.
 
 ```text
 ┌───────────────────┐   USB (hub: C-Media audio + serial bridge)   ┌─────────────────────┐
@@ -235,6 +232,7 @@ the firmware's **CAT audio streaming**:
   - Calibrate `Ref freq` for accurate frequency.
 - Keep the TX offset between about 200 and 2300 Hz; truSDX TX audio bandwidth is about 2.4 kHz.
 - Decoding works from 8-bit audio, but the dynamic range is only about 46 dB. Keep the RX gain/attenuator so the band noise is not clipping.
+- STATUS line 2 shows `truSDX rx <rate>Hz` once streaming. The RX sample rate is measured continuously; it differs between firmware builds, e.g. about 7936 Hz on 2.00x.
 
 ```text
 ┌───────────────────┐        Micro-USB (CH340G, CAT + audio)        ┌─────────────────────┐

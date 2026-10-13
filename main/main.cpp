@@ -2487,16 +2487,18 @@ bool sync_radio_to_current_band(const char* reason) {
 // and S->3 handler cover KH1.
 static void consume_cdc_initial_sync() {
   if (!g_cdc_initial_sync_pending) return;
-  // Retry at most every 2 s: a failing sync otherwise runs every loop pass.
+  // FX-4CR: every sync attempt pauses RX audio (CAT burst), so retry at
+  // most every 2 s. Other radios keep retrying on every loop pass.
+  const bool fx4cr = canonical_radio_type(g_radio) == RadioType::FX4CR;
   static int64_t last_attempt_ms = 0;
   const int64_t now = rtc_now_ms();
-  if (last_attempt_ms != 0 && now - last_attempt_ms < 2000) return;
+  if (fx4cr && last_attempt_ms != 0 && now - last_attempt_ms < 2000) return;
   last_attempt_ms = now;
   static int fx4cr_failures = 0;
   if (sync_radio_to_current_band("initial QMX connect")) {
     g_cdc_initial_sync_pending = false;
     fx4cr_failures = 0;
-  } else if (canonical_radio_type(g_radio) == RadioType::FX4CR && ++fx4cr_failures >= 3) {
+  } else if (fx4cr && ++fx4cr_failures >= 3) {
     // Each FX-4CR attempt pauses RX audio; stop retrying so decoding keeps
     // working. S->2 retries manually.
     g_cdc_initial_sync_pending = false;
@@ -3601,10 +3603,10 @@ static std::string status_sync_line() {
   if (radio == RadioType::TRUSDX || radio == RadioType::FX4CR) {
     // Show connection progress so a missing/undetected radio is visible.
     if (streaming && radio == RadioType::FX4CR) {
-      return head_trim(uac_get_cat_status(), 19);  // e.g. "CAT CDC 1a86:55d4"
+      return head_trim(uac_get_cat_status(), 19);  // e.g. "CAT ok 1a86:7523"
     }
     if (streaming && radio == RadioType::TRUSDX) {
-      return head_trim(audio_source_get_debug_line1(), 19);  // "rx7936 w0 d0"
+      return head_trim(audio_source_get_debug_line1(), 19);  // "truSDX rx 7936Hz"
     }
     if (!streaming) {
       const std::string rx_status = audio_source_get_status_string();

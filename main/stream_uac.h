@@ -49,7 +49,8 @@ const char* uac_get_debug_line2(void);
 bool uac_get_latest_waterfall_row(uint8_t* out_row, int out_len);
 
 bool cat_cdc_ready(void);
-// FX-4CR: "CAT none" / "CAT seen vvvv:pppp" / "CAT CDC vvvv:pppp" / "CAT fail ...".
+// FX-4CR STATUS text: "CAT none", "CAT seen vvvv:pppp", "CAT vvvv:pppp",
+// "CAT ok vvvv:pppp" after a successful burst, or "CATerr <error>".
 const char* uac_get_cat_status(void);
 esp_err_t cat_cdc_send(const uint8_t* data, size_t len, uint32_t timeout_ms);
 

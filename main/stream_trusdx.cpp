@@ -527,9 +527,12 @@ static void update_rate_and_debug(void) {
         s_rx_rate_est = (s_rx_rate_windows == 0) ? rate : s_rx_rate_est + 0.05f * (rate - s_rx_rate_est);
         s_rx_rate_windows++;
     }
-    // Shown on the STATUS line, which fits 19 characters.
-    snprintf(s_dbg1, sizeof(s_dbg1), "rx%.0f w%lu d%lu", (double)s_rx_rate_est,
-             (unsigned long)s_rx_rearms, (unsigned long)s_rx_dropped);
+    // Shown on the STATUS line (19 characters): measured RX sample rate.
+    snprintf(s_dbg1, sizeof(s_dbg1), "truSDX rx %.0fHz", (double)s_rx_rate_est);
+    if (s_rx_dropped || s_rx_rearms) {
+        ESP_LOGD(TAG, "rx drops=%lu rearms=%lu", (unsigned long)s_rx_dropped,
+                 (unsigned long)s_rx_rearms);
+    }
     snprintf(s_dbg2, sizeof(s_dbg2), "tx=%s sent=%llu err=%u", s_tx_active ? "on" : "off",
              (unsigned long long)s_tx_sent, (unsigned)s_tx_write_errors);
 }

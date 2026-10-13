@@ -14,7 +14,6 @@ idf_component_register(
          "stream_uac.cpp"
          "stream_mic.cpp"
          "stream_trusdx.cpp"
-         "log_capture.cpp"
          "dds_q15.cpp"
          "resample.cpp"
     INCLUDE_DIRS "."
