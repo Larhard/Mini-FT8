@@ -14,9 +14,10 @@ idf_component_register(
          "stream_uac.cpp"
          "stream_mic.cpp"
          "stream_trusdx.cpp"
+         "debug_log.cpp"
          "dds_q15.cpp"
          "resample.cpp"
     INCLUDE_DIRS "."
-    REQUIRES ui M5Unified M5GFX M5Cardputer board_cardputer_adv ft8_lib usb_host_uac usb_host_cdc_acm usb_host_ch34x_vcp usb_host_cp210x_vcp storage_service external_rtc efuse
+    REQUIRES ui M5Unified M5GFX M5Cardputer board_cardputer_adv ft8_lib usb_host_uac usb_host_cdc_acm usb_host_ch34x_vcp usb_host_cp210x_vcp storage_service external_rtc efuse espcoredump
 )
 target_compile_options(${COMPONENT_LIB} PRIVATE -Werror)

@@ -41,6 +41,9 @@ extern "C" {
 #include "driver/uart.h"
 #include "driver/gpio.h"
 #include "esp_system.h"
+#include "esp_core_dump.h"
+#include "debug_log.h"
+#include <new>
 #include "esp_random.h"
 #include <cctype>
 #include <cstdlib>
@@ -597,6 +600,7 @@ std::string g_comment1 = "MiniFT8 /Radio";      // visible to core_api.cpp
 static std::string g_ignore_prefix_text;
 std::vector<std::string> g_ignore_prefixes;     // visible to core_api.cpp
 static bool g_rxtx_log = true;
+static bool g_debug_log = false;  // RxTx log "ON+DBG": capture ESP_LOG to DEBUG.txt
 static RadioType canonical_radio_type(RadioType r);
 static RadioType parse_radio_config_value(const char* raw);
 static bool is_kh1_radio(RadioType r);
@@ -936,6 +940,7 @@ static CopyLogsResult copy_logs_to_sd_overwrite() {
     return copy_logs_busy_result();
   }
 
+  if (debug_log_enabled()) debug_log_dump("before copy to SD");
   const CopyLogsResult result = storage_copy_all_to_sd(qso_name, rt_name);
   // SD access temporarily claims GPIO5 (LoRa-1262 CS); restore prior pin policy.
   restore_debug_uart_pins_after_sd();
@@ -3537,7 +3542,7 @@ static void draw_menu_view() {
 #endif
 
   // Page 2 content (index 12+)
-  lines.push_back(std::string("RxTxLog:") + (g_rxtx_log ? "ON" : "OFF"));
+  lines.push_back(std::string("RxTxLog:") + (g_debug_log ? "ON+DBG" : (g_rxtx_log ? "ON" : "OFF")));
   lines.push_back(std::string("SkipTX1:") + (g_skip_tx1 ? "ON" : "OFF"));
   lines.push_back(std::string("ActiveBand:") + head_trim(g_active_band_text, 16));
   lines.push_back(std::string("GNSS_LoRa:") + (g_gnss_lora_enabled ? "ON" : "OFF"));
@@ -3803,6 +3808,9 @@ static void perf_make_heap_line(char* out, size_t out_len, const char* label, ui
            perf_kib_rounded(largest));
 }
 
+static const char* reset_reason_name(esp_reset_reason_t r);
+static esp_reset_reason_t g_last_reset_reason = ESP_RST_UNKNOWN;
+
 static void draw_perf_view(bool force_redraw) {
   static char last_lines[6][32] = {{0}};
   char lines[6][32];
@@ -3820,9 +3828,10 @@ static void draw_perf_view(bool force_redraw) {
   perf_make_heap_line(lines[2], sizeof(lines[2]), "8B", MALLOC_CAP_8BIT);
   perf_make_heap_line(lines[3], sizeof(lines[3]), "IN", MALLOC_CAP_INTERNAL);
   perf_make_heap_line(lines[4], sizeof(lines[4]), "DM", MALLOC_CAP_DMA);
-  snprintf(lines[5], sizeof(lines[5]), "ST C%uK M%uK",
+  snprintf(lines[5], sizeof(lines[5]), "ST C%uK M%uK R:%s",
            perf_kib_rounded(g_app_core0_stack_cur_free_bytes),
-           perf_kib_rounded(g_app_core0_stack_min_free_bytes));
+           perf_kib_rounded(g_app_core0_stack_min_free_bytes),
+           reset_reason_name(g_last_reset_reason));
 
   const int line_h = 19;
   const int start_y = UI_START_Y;
@@ -3862,6 +3871,7 @@ static void debug_update_app_core0_stack_hud(bool redraw_now) {
 }
 
 static void debug_log_line(const std::string& msg) {
+  ESP_LOGI(TAG, "HUD: %s", msg.c_str());  // also lands in DEBUG.txt when enabled
   debug_ensure_hud_lines();
   if (g_debug_lines.size() >= DEBUG_MAX_LINES) {
     if (g_debug_lines.size() > DEBUG_HUD_LINES) {
@@ -4363,6 +4373,9 @@ static void load_station_data() {
       g_ignore_prefix_text = clamp_ignore_prefix_text(trim_upper_copy(line + 16));
     } else if (sscanf(line, "rxtx_log=%d", &val) == 1) {
       g_rxtx_log = (val != 0);
+    } else if (sscanf(line, "debug_log=%d", &val) == 1) {
+      g_debug_log = (val != 0);
+      debug_log_set_enabled(g_debug_log);
     } else if (sscanf(line, "skiptx1=%d", &val) == 1) {
       g_skip_tx1 = (val != 0); autoseq_set_skip_tx1(g_skip_tx1);
     } else if (sscanf(line, "active_band=%d", &val) == 1) { // legacy single value
@@ -4443,6 +4456,7 @@ void save_station_data() {
   out << "comment1=" << g_comment1 << "\n";
   out << "ignore_prefixes=" << g_ignore_prefix_text << "\n";
   out << "rxtx_log=" << (g_rxtx_log ? 1 : 0) << "\n";
+  out << "debug_log=" << (g_debug_log ? 1 : 0) << "\n";
   out << "active_bands=" << g_active_band_text << "\n";
   out << "rtc_sleep_epoch=" << (long long)g_rtc_sleep_epoch << "\n";
   out << "rtc_comp=" << g_rtc_comp << "\n";
@@ -4631,12 +4645,89 @@ static void begin_usb_host_mode() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Last reset reason. Unexpected restarts are either crashes (panic, failed
+// check, stack overflow), watchdog resets or brownouts (supply dip / RF
+// during TX). Abnormal ones are appended to RESETS.txt, with the core dump
+// summary (task, PC, backtrace) when a coredump partition exists, and the
+// reason is shown on the PERFORMANCE view.
+// ---------------------------------------------------------------------------
+// g_last_reset_reason is defined above draw_perf_view.
+
+static const char* reset_reason_name(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON:   return "PWR";
+    case ESP_RST_EXT:       return "EXT";
+    case ESP_RST_SW:        return "SW";
+    case ESP_RST_PANIC:     return "PANIC";
+    case ESP_RST_INT_WDT:   return "IWDT";
+    case ESP_RST_TASK_WDT:  return "TWDT";
+    case ESP_RST_WDT:       return "WDT";
+    case ESP_RST_DEEPSLEEP: return "SLEEP";
+    case ESP_RST_BROWNOUT:  return "BROWN";
+    case ESP_RST_SDIO:      return "SDIO";
+    case ESP_RST_USB:       return "USB";
+    case ESP_RST_JTAG:      return "JTAG";
+    default:                return "?";
+  }
+}
+
+static bool reset_reason_is_abnormal(esp_reset_reason_t r) {
+  return r == ESP_RST_PANIC || r == ESP_RST_INT_WDT || r == ESP_RST_TASK_WDT ||
+         r == ESP_RST_WDT || r == ESP_RST_BROWNOUT;
+}
+
+static void record_last_reset() {
+  g_last_reset_reason = esp_reset_reason();
+  if (!reset_reason_is_abnormal(g_last_reset_reason)) return;
+
+  time_t now = (time_t)(rtc_now_ms() / 1000);
+  struct tm t;
+  gmtime_r(&now, &t);
+  std::string line;
+  char buf[96];
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02dZ reset=%s radio=%s",
+           t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec,
+           reset_reason_name(g_last_reset_reason), radio_name(g_radio));
+  line = buf;
+#if CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH && CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF
+  if (esp_core_dump_image_check() == ESP_OK) {
+    std::unique_ptr<esp_core_dump_summary_t> s(new (std::nothrow) esp_core_dump_summary_t());
+    if (s && esp_core_dump_get_summary(s.get()) == ESP_OK) {
+      snprintf(buf, sizeof(buf), " task=%.16s pc=0x%08lx cause=%lu vaddr=0x%08lx bt=",
+               s->exc_task, (unsigned long)s->exc_pc,
+               (unsigned long)s->ex_info.exc_cause, (unsigned long)s->ex_info.exc_vaddr);
+      line += buf;
+      for (uint32_t i = 0; i < s->exc_bt_info.depth && i < 16; ++i) {
+        snprintf(buf, sizeof(buf), "%s0x%08lx", i ? "," : "", (unsigned long)s->exc_bt_info.bt[i]);
+        line += buf;
+      }
+      if (s->exc_bt_info.corrupted) line += " (bt corrupted)";
+    }
+    esp_core_dump_image_erase();
+  }
+#endif
+  line += "\n";
+  ESP_LOGW(TAG, "Abnormal reset: %s", line.c_str());
+  if (storage_service_firmware_available()) {
+    storage_append_text_locked_path("RESETS.txt", line, "", true);
+  }
+}
+
 static void app_task_core0(void* /*param*/) {
+  debug_log_init();  // keeps lines from before a crash reset
   esp_err_t storage_err = storage_service_init();
   if (storage_err != ESP_OK) {
     ESP_LOGE(TAG, "Storage service init failed: %s; continuing without log/config storage",
              esp_err_to_name(storage_err));
     debug_log_line("Storage init fail");
+  }
+  g_radio = load_station_radio_type_only();  // for the reset record
+  record_last_reset();
+  if (reset_reason_is_abnormal(g_last_reset_reason) && debug_log_has_pre_reset_lines() &&
+      storage_service_firmware_available()) {
+    std::string title = std::string("log before reset (") + reset_reason_name(g_last_reset_reason) + ")";
+    debug_log_dump(title.c_str());
   }
 
   if (storage_service_firmware_available()) {
@@ -5585,7 +5676,16 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 }
             } else if (menu_page == 2) {
               if (c == '1') {
-                g_rxtx_log = !g_rxtx_log;
+                // OFF -> ON -> ON+DBG (also capture system logs) -> OFF
+                if (!g_rxtx_log) {
+                  g_rxtx_log = true;
+                } else if (!g_debug_log) {
+                  g_debug_log = true;
+                } else {
+                  g_rxtx_log = false;
+                  g_debug_log = false;
+                }
+                debug_log_set_enabled(g_debug_log);
                 save_station_data();
                 draw_menu_view();
               } else if (c == '2') {

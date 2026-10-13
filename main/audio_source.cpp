@@ -4,6 +4,7 @@
 #include "stream_mic.h"
 #include "stream_uac.h"
 #include "stream_trusdx.h"
+#include "debug_log.h"
 
 #include "esp_log.h"
 
@@ -78,6 +79,7 @@ void audio_source_stop(void) {
         trusdx_stream_stop();
     }
     s_have_active_backend = false;
+    if (debug_log_enabled()) debug_log_dump("audio stopped");
 }
 
 bool audio_source_is_streaming(void) {
