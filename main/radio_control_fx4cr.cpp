@@ -57,8 +57,9 @@ static esp_err_t fx4cr_begin_tx(int freq_hz, int tx_base_hz) {
     (void)freq_hz;
     (void)tx_base_hz;
     // Keep the mic paused: the TX audio stream needs its host channel next.
-    const char* cmds[] = {k_tx_cmd};
-    esp_err_t err = uac_cat_batch(cmds, 1, false);
+    // Same mode commands as tune (which keys reliably) before TX1.
+    const char* cmds[] = {"MD2;", "DA1;", k_tx_cmd};
+    esp_err_t err = uac_cat_batch(cmds, 3, false);
     if (err != ESP_OK) {
         uac_rx_resume();
         return err;

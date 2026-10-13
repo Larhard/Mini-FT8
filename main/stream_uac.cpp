@@ -525,6 +525,16 @@ static esp_err_t fx_ch340_write(const char* const* cmds, size_t count) {
         if (err == ESP_OK) err = fx_ch340_vendor_write(client, dev, ctrl, 0x9A, 0x2518, 0x00C3);
         if (err == ESP_OK) err = fx_ch340_vendor_write(client, dev, ctrl, 0xA4, 0x0060, 0);
     }
+    // Reprogramming the UART can put a glitch byte on the line; the radio
+    // then sees "<junk>CMD;" and rejects the first command of the burst
+    // (field test: a lone TX1; never keyed, TX1; after other commands did).
+    // Let the line settle, then send ';' to flush the radio's parser.
+    if (err == ESP_OK) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+        bulk->data_buffer[0] = ';';
+        bulk->num_bytes = 1;
+        err = fx_run_xfer(client, bulk, false);
+    }
     for (size_t i = 0; err == ESP_OK && i < count; ++i) {
         const size_t len = strlen(cmds[i]);
         if (len > bulk->data_buffer_size) {
