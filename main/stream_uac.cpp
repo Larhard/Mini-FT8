@@ -186,6 +186,8 @@ static uint8_t s_spk_channels = 2;
 static bool s_spk_swap_mode = false;
 static bool s_spk_fmt_known = false;
 static volatile bool s_mic_paused = false;
+static volatile bool s_mic_restart_needed = false;  // a restart failed; retry
+static void mic_resume_after_tx(void);
 static void spk_event_cb(uac_host_device_handle_t dev,
                          const uac_host_device_event_t event,
                          void* arg);
@@ -1132,6 +1134,16 @@ static int uac_read_ft8_samples(void* ctx, float* out, int max_samples) {
         if (ret != ESP_OK || bytes_read == 0) {
             if (ret == ESP_ERR_INVALID_STATE) {
                 vTaskDelay(pdMS_TO_TICKS(20));  // stream not active (FX-4CR TX/CAT)
+                // Safety net: a failed restart must not freeze RX for good.
+                static int64_t last_retry_ms = 0;
+                const int64_t now = rtc_now_ms();
+                if (s_mic_restart_needed && !s_spk_writer_run && now - last_retry_ms > 1000 &&
+                    s_cat_lock && xSemaphoreTake(s_cat_lock, 0) == pdTRUE) {
+                    last_retry_ms = now;
+                    s_mic_paused = true;  // mic_resume_after_tx() acts only when paused
+                    mic_resume_after_tx();
+                    xSemaphoreGive(s_cat_lock);
+                }
             } else if (ret != ESP_ERR_TIMEOUT && ret != ESP_FAIL) {
                 ESP_LOGW(TAG, "USB read error: %s", esp_err_to_name(ret));
             }
@@ -1224,6 +1236,7 @@ bool uac_start_with_profile(uac_stream_profile_t profile) {
     s_spk_swap_mode = (profile == UAC_PROFILE_FX4CR);
     s_spk_fmt_known = false;
     s_mic_paused = false;
+    s_mic_restart_needed = false;
     s_format.sample_freq = UAC_SAMPLE_RATE;
     s_format.bit_resolution = UAC_BIT_RESOLUTION;
     s_format.channels = UAC_CHANNELS;
@@ -1360,24 +1373,30 @@ static void spk_writer_task(void* /*arg*/) {
     vTaskDelete(NULL);
 }
 
-// Stop the mic stream to free its host channel (FX-4CR TX / CAT batch).
-static void mic_pause_for_usb(void) {
-    if (s_mic_paused || !s_mic_handle) return;
-    s_mic_paused = true;
-    // uac_host_device_stop() suspends, then releases the interface. The
-    // release is refused (ESP_ERR_INVALID_STATE) while the just-cancelled
-    // ISO transfers are still in flight / unprocessed by the UAC client
-    // task, which leaves the channel claimed (field log). Retry: the second
-    // call only releases, once the transfers have drained.
+// Stop a UAC stream and really release its interface (= its host channel).
+// uac_host_device_stop() suspends, then releases. The release is refused
+// (ESP_ERR_INVALID_STATE) while the just-cancelled ISO transfers are still
+// in flight / unprocessed by the UAC client task, leaving the channel
+// claimed (field logs, mic and speaker alike). Retry: once suspended, a
+// further call only releases, which succeeds after the transfers drain.
+static esp_err_t uac_stop_and_release(uac_host_device_handle_t handle, const char* what) {
     esp_err_t err = ESP_FAIL;
     for (int attempt = 0; attempt < 10; ++attempt) {
-        err = uac_host_device_stop(s_mic_handle);
+        err = uac_host_device_stop(handle);
         if (err == ESP_OK) break;
         vTaskDelay(pdMS_TO_TICKS(20));
     }
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "mic stop failed: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "%s stop failed: %s", what, esp_err_to_name(err));
     }
+    return err;
+}
+
+// Stop the mic stream to free its host channel (FX-4CR TX / CAT batch).
+static void mic_pause_for_usb(void) {
+    if (s_mic_paused || !s_mic_handle) return;
+    s_mic_paused = true;
+    uac_stop_and_release(s_mic_handle, "mic");
 }
 
 static void mic_resume_after_tx(void) {
@@ -1396,6 +1415,7 @@ static void mic_resume_after_tx(void) {
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "mic restart after TX failed: %s", esp_err_to_name(err));
         }
+        s_mic_restart_needed = (err != ESP_OK);  // read loop retries
     }
     s_mic_paused = false;
 }
@@ -1517,7 +1537,7 @@ void uac_tx_end_ex(bool resume_rx) {
 
     if (s_spk_handle) {
         if (s_spk_swap_mode) {
-            uac_host_device_stop(s_spk_handle);  // release the channel
+            uac_stop_and_release(s_spk_handle, "speaker");  // free the channel
             if (resume_rx) mic_resume_after_tx();
         } else {
             uac_host_device_suspend(s_spk_handle);

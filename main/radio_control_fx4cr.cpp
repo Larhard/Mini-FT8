@@ -26,6 +26,12 @@ static const char* TAG = "RADIO_FX4CR";
 // CAT burst, i.e. one RX audio pause.
 static bool s_keyed = false;
 
+// TS-590 "TX1;" = DATA SEND (audio from USB/ACC2); plain "TX;" is SEND with
+// the mic as audio source. F5BUD documents WSJT-X with rig TS-590S and
+// mode Data/Pkt, for which Hamlib keys with TX1. Field test: "TX;" with the
+// UAC stream running produced no RF.
+static const char k_tx_cmd[] = "TX1;";
+
 static bool fx4cr_ready(void) {
     return cat_cdc_ready();
 }
@@ -35,7 +41,7 @@ static bool fx4cr_ready(void) {
 static esp_err_t fx4cr_send_sync(int freq_hz, bool then_tx, bool resume_rx) {
     char fa[32];
     snprintf(fa, sizeof(fa), "FA%011d;", freq_hz);
-    const char* cmds[] = {"MD2;", "DA1;", "FR0;", "FT0;", fa, "TX;"};
+    const char* cmds[] = {"MD2;", "DA1;", "FR0;", "FT0;", fa, k_tx_cmd};
     return uac_cat_batch(cmds, then_tx ? 6 : 5, resume_rx);
 }
 
@@ -51,7 +57,7 @@ static esp_err_t fx4cr_begin_tx(int freq_hz, int tx_base_hz) {
     (void)freq_hz;
     (void)tx_base_hz;
     // Keep the mic paused: the TX audio stream needs its host channel next.
-    const char* cmds[] = {"TX;"};
+    const char* cmds[] = {k_tx_cmd};
     esp_err_t err = uac_cat_batch(cmds, 1, false);
     if (err != ESP_OK) {
         uac_rx_resume();
