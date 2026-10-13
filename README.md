@@ -86,7 +86,7 @@ Mini-FT8 is built on Karlis Goba’s ft8_lib. It’s also a joint adventure betw
 |  | `4` | Edit ignore list (Long Edit). Prefixes are separated by spaces; maximum 64 characters. |
 |  | `5` | Edit comment (Long Edit). Used for ADIF logging. Supports `/Radio` and `/Grid` macro expansion. |
 |  | `6` | Select FT8 / FT4 protocol. Reboot to apply the change. |
-| `O` (MENU P3) | `1` | Turn RxTx log on/off. Note: RxTxLog has been renamed to `RT[YYMMDD].txt`. |
+| `O` (MENU P3) | `1` | Cycle RxTx log: `OFF` → `ON` → `ON+DBG` → `OFF`. Note: RxTxLog has been renamed to `RT[YYMMDD].txt`. `ON+DBG` also captures the system log for troubleshooting (see Debug Logging). |
 |  | `2` | Turn SkipTX1 on/off. Skips `dxcall mycall mygrid` and replies with the SNR report. |
 |  | `3` | Edit active bands (Long Edit). Used by STATUS -> Band. |
 |  | `4` | Toggle `GNSS_LoRa`. `OFF` uses PORTA GPS; `ON` uses the LoRa-1262 cap GNSS. |
@@ -242,3 +242,18 @@ the firmware's **CAT audio streaming**:
                                                                     │ SW: 5VIN (Right)    │
                                                                     └─────────────────────┘
 ```
+
+## Debug Logging
+
+While a radio uses the Cardputer's USB-C port there is no serial console. For troubleshooting, set MENU P3 `1` to `ON+DBG`:
+
+- All system log lines are kept in a small RAM buffer (about the last minute). The buffer survives a crash reboot.
+- The buffer is appended to `DEBUG.txt` at these points only, never continuously:
+  - when radio audio stops (e.g. changing the radio type),
+  - right before `O` -> `5` copies files to SD,
+  - after an unexpected restart, under a `log before reset (<reason>)` heading.
+- Independently of this setting, every unexpected restart (crash, watchdog or brownout) is recorded in `RESETS.txt`. When the flash has a coredump partition, the record also includes the crashing task, program counter and backtrace.
+- The PERFORMANCE view (`P`) shows the last reset reason (`R:`):
+  - `BROWN` means a supply dip, often caused by TX current or RF getting into the Cardputer.
+  - `PANIC` / `TWDT` / `IWDT` point to a software fault.
+- Copy the files to SD with `O` -> `5` and attach them to bug reports.
