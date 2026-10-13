@@ -20,6 +20,7 @@
 #include "usb/vcp_ch34x.h"
 #include "usb/vcp_cp210x.h"
 #include "usb/usb_types_ch9.h"
+#include "usb/usb_helpers.h"
 
 #include <cstring>
 #include <cmath>
@@ -396,6 +397,153 @@ static void cdc_try_open(void) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// FX-4CR: write-only CH340 CAT
+//
+// Field log: the FX-4CR exposes two hubs (2 channels each) plus codec, CH340
+// and a Bluetooth module (EP0 each) = 7 of the ESP32-S3's 8 host channels
+// held permanently. The CH340 interface has bulk IN + bulk OUT + interrupt
+// IN, so a normal claim needs 3 more. CAT only needs bulk OUT: with the
+// patched usb component (components/espressif__usb) the claim allocates just
+// that endpoint, 7 + 1 = 8. The CDC driver cannot be used (it requires the
+// interrupt endpoint), so this is a minimal driver on the usb_host client API.
+// ---------------------------------------------------------------------------
+static volatile bool s_ep_filter_out_only = false;
+static usb_device_handle_t s_ep_filter_dev = NULL;
+static uint8_t s_vcp_addr = 0;
+
+// C linkage: overrides the weak default in the patched usb component.
+extern "C" bool usb_host_claim_ep_filter(usb_device_handle_t dev_hdl, const usb_ep_desc_t* ep_desc) {
+    if (!s_ep_filter_out_only || dev_hdl != s_ep_filter_dev || !ep_desc) return true;
+    return USB_EP_DESC_GET_EP_DIR(ep_desc) == 0 &&
+           USB_EP_DESC_GET_XFERTYPE(ep_desc) == USB_TRANSFER_TYPE_BULK;
+}
+
+static void fx_xfer_cb(usb_transfer_t* transfer) {
+    xSemaphoreGive(static_cast<SemaphoreHandle_t>(transfer->context));
+}
+
+static void fx_client_event_cb(const usb_host_client_event_msg_t* msg, void* arg) {
+    (void)msg;
+    (void)arg;
+}
+
+// Submit and wait, pumping this client's events (callbacks run there).
+static esp_err_t fx_run_xfer(usb_host_client_handle_t client, usb_transfer_t* xfer, bool control) {
+    SemaphoreHandle_t done = static_cast<SemaphoreHandle_t>(xfer->context);
+    esp_err_t err = control ? usb_host_transfer_submit_control(client, xfer)
+                            : usb_host_transfer_submit(xfer);
+    if (err != ESP_OK) return err;
+    for (int i = 0; i < 100; ++i) {
+        usb_host_client_handle_events(client, pdMS_TO_TICKS(10));
+        if (xSemaphoreTake(done, 0) == pdTRUE) {
+            return xfer->status == USB_TRANSFER_STATUS_COMPLETED ? ESP_OK : ESP_FAIL;
+        }
+    }
+    // Still in flight: keep pumping until the stack hands it back, so the
+    // transfer can be freed safely.
+    while (xSemaphoreTake(done, 0) != pdTRUE) {
+        usb_host_client_handle_events(client, pdMS_TO_TICKS(10));
+    }
+    return ESP_ERR_TIMEOUT;
+}
+
+static esp_err_t fx_ch340_vendor_write(usb_host_client_handle_t client, usb_device_handle_t dev,
+                                       usb_transfer_t* ctrl, uint8_t request,
+                                       uint16_t value, uint16_t index) {
+    usb_setup_packet_t* setup = reinterpret_cast<usb_setup_packet_t*>(ctrl->data_buffer);
+    setup->bmRequestType = USB_BM_REQUEST_TYPE_TYPE_VENDOR | USB_BM_REQUEST_TYPE_RECIP_DEVICE |
+                           USB_BM_REQUEST_TYPE_DIR_OUT;
+    setup->bRequest = request;
+    setup->wValue = value;
+    setup->wIndex = index;
+    setup->wLength = 0;
+    ctrl->num_bytes = sizeof(usb_setup_packet_t);
+    ctrl->device_handle = dev;
+    ctrl->bEndpointAddress = 0;
+    return fx_run_xfer(client, ctrl, true);
+}
+
+static esp_err_t fx_ch340_write(const char* const* cmds, size_t count) {
+    if (s_vcp_addr == 0) return ESP_ERR_NOT_FOUND;
+    usb_host_client_handle_t client = NULL;
+    usb_host_client_config_t ccfg = {};
+    ccfg.is_synchronous = false;
+    ccfg.max_num_event_msg = 5;
+    ccfg.async.client_event_callback = fx_client_event_cb;
+    ccfg.async.callback_arg = NULL;
+    esp_err_t err = usb_host_client_register(&ccfg, &client);
+    if (err != ESP_OK) return err;
+
+    usb_device_handle_t dev = NULL;
+    usb_transfer_t* ctrl = NULL;
+    usb_transfer_t* bulk = NULL;
+    SemaphoreHandle_t done = xSemaphoreCreateBinary();
+    bool claimed = false;
+    uint8_t out_ep = 0;
+    const usb_config_desc_t* cfg_desc = NULL;
+
+    err = done ? usb_host_device_open(client, s_vcp_addr, &dev) : ESP_ERR_NO_MEM;
+    if (err == ESP_OK) err = usb_host_get_active_config_descriptor(dev, &cfg_desc);
+    if (err == ESP_OK) {
+        int offset = 0;
+        const usb_intf_desc_t* intf = usb_parse_interface_descriptor(cfg_desc, 0, 0, &offset);
+        for (int i = 0; intf && i < intf->bNumEndpoints && out_ep == 0; ++i) {
+            int ep_offset = offset;
+            const usb_ep_desc_t* ep = usb_parse_endpoint_descriptor_by_index(
+                intf, i, cfg_desc->wTotalLength, &ep_offset);
+            if (ep && USB_EP_DESC_GET_EP_DIR(ep) == 0 &&
+                USB_EP_DESC_GET_XFERTYPE(ep) == USB_TRANSFER_TYPE_BULK) {
+                out_ep = ep->bEndpointAddress;
+            }
+        }
+        if (out_ep == 0) err = ESP_ERR_NOT_FOUND;
+    }
+    if (err == ESP_OK) {
+        s_ep_filter_dev = dev;
+        s_ep_filter_out_only = true;
+        err = usb_host_interface_claim(client, dev, 0, 0);
+        s_ep_filter_out_only = false;
+        claimed = (err == ESP_OK);
+    }
+    if (err == ESP_OK) err = usb_host_transfer_alloc(64, 0, &ctrl);
+    if (err == ESP_OK) err = usb_host_transfer_alloc(64, 0, &bulk);
+    if (err == ESP_OK) {
+        ctrl->callback = fx_xfer_cb;
+        ctrl->context = done;
+        ctrl->timeout_ms = 500;
+        bulk->callback = fx_xfer_cb;
+        bulk->context = done;
+        bulk->timeout_ms = 500;
+        bulk->device_handle = dev;
+        bulk->bEndpointAddress = out_ep;
+        // 115200 8N1 (values from the espressif CH34x driver's divisor math),
+        // then DTR/RTS inactive: RTS is PTT on the F5BUD firmware.
+        err = fx_ch340_vendor_write(client, dev, ctrl, 0x9A, 0x1312, 0xCC83);
+        if (err == ESP_OK) err = fx_ch340_vendor_write(client, dev, ctrl, 0x9A, 0x2518, 0x00C3);
+        if (err == ESP_OK) err = fx_ch340_vendor_write(client, dev, ctrl, 0xA4, 0x0060, 0);
+    }
+    for (size_t i = 0; err == ESP_OK && i < count; ++i) {
+        const size_t len = strlen(cmds[i]);
+        if (len > bulk->data_buffer_size) {
+            err = ESP_ERR_INVALID_SIZE;
+            break;
+        }
+        memcpy(bulk->data_buffer, cmds[i], len);
+        bulk->num_bytes = (int)len;
+        err = fx_run_xfer(client, bulk, false);
+    }
+    if (err == ESP_OK) vTaskDelay(pdMS_TO_TICKS(10));  // UART drains the last bytes
+
+    if (ctrl) usb_host_transfer_free(ctrl);
+    if (bulk) usb_host_transfer_free(bulk);
+    if (claimed) usb_host_interface_release(client, dev, 0);
+    if (dev) usb_host_device_close(client, dev);
+    usb_host_client_deregister(client);
+    if (done) vSemaphoreDelete(done);
+    return err;
+}
+
 static void cdc_new_dev_cb(usb_device_handle_t usb_dev) {
     usb_device_info_t info = {};
     if (usb_host_device_info(usb_dev, &info) == ESP_OK) {
@@ -455,6 +603,7 @@ static void cdc_new_dev_cb(usb_device_handle_t usb_dev) {
         if (known_vid || comm_iface >= 0 || vendor_iface >= 0) {
             s_vcp_vid = dev_desc->idVendor;
             s_vcp_pid = dev_desc->idProduct;
+            s_vcp_addr = info.dev_addr;
             s_vcp_iface = comm_iface >= 0 ? comm_iface : (vendor_iface >= 0 ? vendor_iface : 0);
             snprintf(s_cat_status, sizeof(s_cat_status), "CAT seen %04x:%04x",
                      s_vcp_vid, s_vcp_pid);
@@ -1061,6 +1210,7 @@ bool uac_start_with_profile(uac_stream_profile_t profile) {
     s_vcp_vid = 0;
     s_vcp_pid = 0;
     s_vcp_iface = 0;
+    s_vcp_addr = 0;
     s_usb_dev_count = 0;
     s_fx_cat_announced = false;
     s_cat_fail_ms = 0;
@@ -1435,6 +1585,28 @@ esp_err_t uac_cat_batch_ex(const char* const* cmds, size_t count, bool resume_rx
     if (s_cat_lock) xSemaphoreTake(s_cat_lock, portMAX_DELAY);
 
     mic_pause_for_usb();
+    if (s_vcp_vid == NANJING_QINHENG_MICROE_VID && is_legacy_ch34x_pid(s_vcp_pid)) {
+        esp_err_t werr = fx_ch340_write(cmds, count);
+        if (werr == ESP_OK) {
+            snprintf(s_cat_status, sizeof(s_cat_status), "CAT ok %04x:%04x", s_vcp_vid, s_vcp_pid);
+        } else {
+            snprintf(s_cat_status, sizeof(s_cat_status), "CATerr e%x n%d", (unsigned)werr, s_usb_dev_count);
+            ESP_LOGW(TAG, "FX-4CR CH340 write failed: %s (mic_paused=%d)",
+                     esp_err_to_name(werr), (int)s_mic_paused);
+            s_cat_fail_ms = rtc_now_ms();
+            s_cat_fail_count++;
+        }
+        if (resume_rx) mic_resume_after_tx();
+        if (s_cat_lock) xSemaphoreGive(s_cat_lock);
+        if (werr != ESP_OK && !s_cat_log_dumped) {
+            s_cat_log_dumped = true;
+            log_capture_dump(k_usb_log_file);
+        } else if (werr == ESP_OK) {
+            s_cat_fail_ms = 0;
+            s_cat_fail_count = 0;
+        }
+        return werr;
+    }
     cdc_acm_host_device_config_t dev_cfg = {
         .connection_timeout_ms = 500,
         .out_buffer_size = 64,

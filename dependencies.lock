@@ -55,14 +55,12 @@ dependencies:
     - esp32s31
     version: 0.19.0~3
   espressif/usb:
-    component_hash: f583375dac409f4287f3be9c188e54200b01a5ae774194b3bfee7d67e4e269d0
     dependencies:
     - name: idf
-      require: private
       version: '>=5.4'
     source:
-      registry_url: https://components.espressif.com/
-      type: service
+      path: /project/components/espressif__usb
+      type: local
     targets:
     - esp32s2
     - esp32s3
@@ -166,6 +164,6 @@ direct_dependencies:
 - espressif/usb_host_uac
 - idf
 - lvgl/lvgl
-manifest_hash: f582a758ec8a1620faaee62d55ac7419030da65f257eb83a0ea8f828a767c417
+manifest_hash: f9e20b5f44ad788630617c3af0f108e79771e6fcb8772a16ed51c56d707e2762
 target: esp32s3
 version: 2.0.0
