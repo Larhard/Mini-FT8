@@ -39,15 +39,13 @@ static bool fx4cr_ready(void) {
 // DA1 additionally requests TS-590 data mode; ignored if unsupported.
 // Split: unlike a real TS-590, on F5BUD "FR0;" turns split OFF and "FT0;"
 // turns it ON (RX on VFO A, TX on VFO B) - tested on the radio. Send FR0
-// (clears a split left from earlier) and never FT. VFO B is also set to the
-// band frequency, so TX stays on frequency even if split were on.
+// (clears a split left from earlier) and never FT. Only VFO A is set, so
+// VFO B stays free for the operator (e.g. a voice calling frequency).
 static esp_err_t fx4cr_send_sync(int freq_hz, bool then_tx, bool resume_rx) {
     char fa[32];
-    char fb[32];
     snprintf(fa, sizeof(fa), "FA%011d;", freq_hz);
-    snprintf(fb, sizeof(fb), "FB%011d;", freq_hz);
-    const char* cmds[] = {"MD2;", "DA1;", "FR0;", fa, fb, k_tx_cmd};
-    return uac_cat_batch(cmds, then_tx ? 6 : 5, resume_rx);
+    const char* cmds[] = {"MD2;", "DA1;", "FR0;", fa, k_tx_cmd};
+    return uac_cat_batch(cmds, then_tx ? 5 : 4, resume_rx);
 }
 
 static esp_err_t fx4cr_sync_frequency_mode(int freq_hz) {
