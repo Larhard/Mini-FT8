@@ -37,11 +37,16 @@ static bool fx4cr_ready(void) {
 
 // MD2 = USB, which F5BUD maps to DATA-U when "Digital mode (CAT)" = DATA.
 // DA1 additionally requests TS-590 data mode; ignored if unsupported.
+// FR0/FT0 ask for RX and TX on VFO A, but the radio was seen transmitting on
+// VFO B anyway. Setting VFO B to the same frequency keeps TX on frequency
+// whichever VFO the radio transmits on.
 static esp_err_t fx4cr_send_sync(int freq_hz, bool then_tx, bool resume_rx) {
     char fa[32];
+    char fb[32];
     snprintf(fa, sizeof(fa), "FA%011d;", freq_hz);
-    const char* cmds[] = {"MD2;", "DA1;", "FR0;", "FT0;", fa, k_tx_cmd};
-    return uac_cat_batch(cmds, then_tx ? 6 : 5, resume_rx);
+    snprintf(fb, sizeof(fb), "FB%011d;", freq_hz);
+    const char* cmds[] = {"MD2;", "DA1;", "FR0;", "FT0;", fa, fb, k_tx_cmd};
+    return uac_cat_batch(cmds, then_tx ? 7 : 6, resume_rx);
 }
 
 static esp_err_t fx4cr_sync_frequency_mode(int freq_hz) {
